@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pandas
+numpy
+pandas-ta
+yfinance
+pydantic
+mysql-connector-python
+sqlalchemy
