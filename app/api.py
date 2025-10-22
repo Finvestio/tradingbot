@@ -74,3 +74,60 @@ def run_strategy(payload: dict):
     }
 
     return result
+
+
+# -------------------------------------------------------------
+# Get trading signals endpoint
+# -------------------------------------------------------------
+@app.get("/api/signals")
+def get_signals(symbol: str, fast: int = 10, slow: int = 20):
+    """
+    Get trading signals for a given symbol and SMA parameters.
+    Returns the last 20 rows with Date, Close, SMA_fast, SMA_slow, and Signal.
+    
+    Parameters:
+    - symbol: Stock symbol (e.g., "AAPL")
+    - fast: Fast SMA window size (default: 10)
+    - slow: Slow SMA window size (default: 20)
+    """
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+
+    # Load market data
+    try:
+        df = load_market_data(symbol)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # ---------------------------------------------------------
+    # Compute SMAs and signals
+    # ---------------------------------------------------------
+    df["SMA_fast"] = df["Close"].rolling(fast).mean()
+    df["SMA_slow"] = df["Close"].rolling(slow).mean()
+    
+    # Create Signal column
+    df["Signal"] = 0
+    df.loc[df["SMA_fast"] > df["SMA_slow"], "Signal"] = 1
+    df.loc[df["SMA_fast"] < df["SMA_slow"], "Signal"] = -1
+
+    # ---------------------------------------------------------
+    # Prepare the last 20 rows with required columns
+    # ---------------------------------------------------------
+    # Get the last 20 rows, reset index, and format properly
+    result_df = df[["Close", "SMA_fast", "SMA_slow", "Signal"]].tail(20).reset_index()
+    
+    # Ensure proper column naming (Date should be the first column after reset_index)
+    result_df.columns = ["Date", "Close", "SMA_fast", "SMA_slow", "Signal"]
+    
+    # Format the Date column as string
+    result_df["Date"] = result_df["Date"].dt.strftime("%Y-%m-%d")
+    
+    # Convert to dictionary format
+    result = {
+        "symbol": symbol,
+        "fast": fast,
+        "slow": slow,
+        "signals": result_df.to_dict(orient="records")
+    }
+
+    return result
