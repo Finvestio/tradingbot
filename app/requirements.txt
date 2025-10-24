@@ -1,9 +1,22 @@
+# FastAPI and Web Server
 fastapi
 uvicorn
+
+# Data Processing and Analysis
 pandas
 numpy
 pandas-ta
 yfinance
 pydantic
-mysql-connector-python
+
+# Database
 sqlalchemy
+pymysql
+mysql-connector-python
+alembic
+python-dotenv
+
+# Reinforcement Learning
+gymnasium
+stable-baselines3
+torch

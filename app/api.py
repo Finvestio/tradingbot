@@ -1,10 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from app.data.loader import load_market_data
-from app.backtest.metrics import compute_equity_curve, compute_metrics
 import pandas as pd
 
+# Use relative imports when running as module, absolute when standalone
+try:
+    from .data.loader import load_market_data
+    from .backtest.metrics import compute_equity_curve, compute_metrics
+    from .api_orders import router as orders_router
+except ImportError:
+    from data.loader import load_market_data
+    from backtest.metrics import compute_equity_curve, compute_metrics
+    from api_orders import router as orders_router
+
 app = FastAPI(title="Trading Bot API")
+
+# Register the orders router
+app.include_router(orders_router)
 
 # -------------------------------------------------------------
 # CORS configuration
@@ -131,3 +142,49 @@ def get_signals(symbol: str, fast: int = 10, slow: int = 20):
     }
 
     return result
+
+@app.get("/api/market_data")
+async def get_market_data(symbol: str):
+    """
+    Get cached market data for a symbol from MySQL database
+    """
+    try:
+        df = load_market_data(symbol)
+        
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No market data found for symbol {symbol}")
+        
+        # Reset index to make sure Date is a column
+        if df.index.name == 'Date' or 'Date' not in df.columns:
+            df = df.reset_index()
+        
+        # Convert DataFrame to list of dictionaries
+        market_data = []
+        for _, row in df.iterrows():
+            # Handle date field - it might be in different formats
+            date_val = row.get('Date', row.name if hasattr(row, 'name') else None)
+            if pd.isna(date_val):
+                continue
+                
+            # Convert date to string format
+            if hasattr(date_val, 'strftime'):
+                date_str = date_val.strftime('%Y-%m-%d')
+            else:
+                date_str = str(date_val)
+            
+            market_data.append({
+                "symbol": symbol.upper(),
+                "date": date_str,
+                "open": float(row.get('Open', row.get('open', 0))),
+                "high": float(row.get('High', row.get('high', 0))),
+                "low": float(row.get('Low', row.get('low', 0))),
+                "close": float(row.get('Close', row.get('close', 0))),
+                "volume": int(row.get('Volume', row.get('volume', 0)))
+            })
+        
+        return market_data
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error retrieving market data: {str(e)}")
