@@ -83,6 +83,19 @@ class User(Base):
     wallet_balance = Column(Float, default=100000.0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     trades = relationship("OrderTrade", back_populates="user")
+    portfolios = relationship("Portfolio", back_populates="user")
+
+# Portfolio Model for Multi-Asset Holdings
+class Portfolio(Base):
+    __tablename__ = "portfolios"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    symbol = Column(String(20), nullable=False)
+    asset_type = Column(String(20), nullable=False)  # 'stock', 'crypto', 'derivative', etc.
+    quantity = Column(Float, default=0.0)
+    avg_price = Column(Float, default=0.0)
+    user = relationship("User", back_populates="portfolios")
 
 # Trade Model for Order Management (renamed to avoid conflict)
 class OrderTrade(Base):
@@ -90,7 +103,8 @@ class OrderTrade(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"))
-    symbol = Column(String(10))
+    symbol = Column(String(20))  # Increased to 20 to support crypto symbols
+    asset_type = Column(String(20), default="stock")  # Add asset type to trades
     date = Column(Date)
     action = Column(String(4))  # BUY / SELL
     price = Column(Float)

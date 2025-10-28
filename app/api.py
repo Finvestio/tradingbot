@@ -1,6 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from app.data.loader import load_market_data
 import pandas as pd
+import os, requests
+from fastapi import Query
+from dotenv import load_dotenv
+import os
 
 # Use relative imports when running as module, absolute when standalone
 try:
@@ -31,9 +36,64 @@ app.add_middleware(
 # -------------------------------------------------------------
 # Root endpoint
 # -------------------------------------------------------------
+@app.get("/api/test_twelvedata")
+def test_twelvedata(symbol: str = Query("AAPL")):
+    key = os.getenv("TWELVEDATA_API_KEY")
+    if not key:
+        return {"error": "Missing TWELVEDATA_API_KEY in .env"}
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1day&outputsize=30&apikey={key}"
+    r = requests.get(url)
+    return r.json()
 @app.get("/")
 def root():
     return {"message": "Trading Bot API is running."}
+
+# -------------------------------------------------------------
+# Asset symbols configuration endpoint
+# -------------------------------------------------------------
+@app.get("/api/asset-symbols")
+def get_asset_symbols():
+    """
+    Get available symbols by asset type for frontend dropdowns
+    """
+    return {
+        "stock": [
+            {"symbol": "AAPL", "name": "Apple Inc."},
+            {"symbol": "GOOGL", "name": "Alphabet Inc."},
+            {"symbol": "MSFT", "name": "Microsoft Corp."},
+            {"symbol": "TSLA", "name": "Tesla Inc."},
+            {"symbol": "AMZN", "name": "Amazon.com Inc."},
+            {"symbol": "NVDA", "name": "NVIDIA Corp."},
+            {"symbol": "META", "name": "Meta Platforms Inc."},
+            {"symbol": "NFLX", "name": "Netflix Inc."},
+            {"symbol": "AMD", "name": "Advanced Micro Devices"},
+            {"symbol": "ORCL", "name": "Oracle Corp."}
+        ],
+        "crypto": [
+            {"symbol": "BTC/USD", "name": "Bitcoin"},
+            {"symbol": "ETH/USD", "name": "Ethereum"},
+            {"symbol": "ADA/USD", "name": "Cardano"},
+            {"symbol": "SOL/USD", "name": "Solana"},
+            {"symbol": "DOT/USD", "name": "Polkadot"},
+            {"symbol": "AVAX/USD", "name": "Avalanche"},
+            {"symbol": "MATIC/USD", "name": "Polygon"},
+            {"symbol": "LINK/USD", "name": "Chainlink"},
+            {"symbol": "UNI/USD", "name": "Uniswap"},
+            {"symbol": "ATOM/USD", "name": "Cosmos"}
+        ],
+        "derivative": [
+            {"symbol": "SPY", "name": "SPDR S&P 500 ETF"},
+            {"symbol": "QQQ", "name": "Invesco QQQ Trust"},
+            {"symbol": "VIX", "name": "CBOE Volatility Index"},
+            {"symbol": "GLD", "name": "SPDR Gold Shares"},
+            {"symbol": "TLT", "name": "iShares 20+ Year Treasury"},
+            {"symbol": "IWM", "name": "iShares Russell 2000"},
+            {"symbol": "EFA", "name": "iShares MSCI EAFE"},
+            {"symbol": "EEM", "name": "iShares MSCI Emerging"},
+            {"symbol": "XLE", "name": "Energy Select Sector"},
+            {"symbol": "XLF", "name": "Financial Select Sector"}
+        ]
+    }
 
 # -------------------------------------------------------------
 # Run trading strategy endpoint
@@ -55,11 +115,24 @@ def run_strategy(payload: dict):
     # Load market data
     try:
         df = load_market_data(symbol)
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No market data found for symbol {symbol}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     # ---------------------------------------------------------
-    # Simple SMA crossover strategy
+    # Ensure datetime index and create Date column properly
+    # ---------------------------------------------------------
+    # Make sure index is datetime
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    
+    # Create Date column from index
+    df = df.copy()  # Avoid SettingWithCopyWarning
+    df["Date"] = pd.to_datetime(df.index)
+
+    # ---------------------------------------------------------
+    # Simple SMA crossover strategy with proper logic
     # ---------------------------------------------------------
     df["SMA_fast"] = df["Close"].rolling(fast).mean()
     df["SMA_slow"] = df["Close"].rolling(slow).mean()
@@ -72,16 +145,27 @@ def run_strategy(payload: dict):
     metrics = compute_metrics(equity_curve)
 
     # ---------------------------------------------------------
-    # Prepare the last 10 equity points for the frontend table
+    # Prepare the last 10 equity points for frontend with proper date formatting
     # ---------------------------------------------------------
     equity_df = equity_curve.tail(10).reset_index()
     equity_df.columns = ["Date", "Equity"]
+    # Convert Date to datetime if not already
+    equity_df["Date"] = pd.to_datetime(equity_df["Date"])
+    # Format Date as string
+    equity_df["Date"] = equity_df["Date"].dt.strftime("%Y-%m-%d")
     equity_df["Equity"] = equity_df["Equity"].astype(float)
 
+    # ---------------------------------------------------------
+    # Prepare recent price and signal data for frontend
+    # ---------------------------------------------------------
+    recent_df = df[["Date", "Close", "SMA_fast", "SMA_slow", "Signal"]].tail(20).copy()
+    recent_df["Date"] = recent_df["Date"].dt.strftime("%Y-%m-%d")
+    
     result = {
         "symbol": symbol,
         "metrics": metrics,
         "equity": equity_df.to_dict(orient="records"),
+        "recent_data": recent_df.to_dict(orient="records")
     }
 
     return result
@@ -94,7 +178,7 @@ def run_strategy(payload: dict):
 def get_signals(symbol: str, fast: int = 10, slow: int = 20):
     """
     Get trading signals for a given symbol and SMA parameters.
-    Returns the last 20 rows with Date, Close, SMA_fast, SMA_slow, and Signal.
+    Returns JSON array format: [{"Date": "2024-05-01", "Close": 189.3, "Signal": 1}]
     
     Parameters:
     - symbol: Stock symbol (e.g., "AAPL")
@@ -107,11 +191,24 @@ def get_signals(symbol: str, fast: int = 10, slow: int = 20):
     # Load market data
     try:
         df = load_market_data(symbol)
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No market data found for symbol {symbol}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     # ---------------------------------------------------------
-    # Compute SMAs and signals
+    # Ensure datetime index and create Date column properly
+    # ---------------------------------------------------------
+    # Make sure index is datetime
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    
+    # Create Date column from index
+    df = df.copy()  # Avoid SettingWithCopyWarning
+    df["Date"] = pd.to_datetime(df.index)
+
+    # ---------------------------------------------------------
+    # Compute SMAs and signals with proper logic
     # ---------------------------------------------------------
     df["SMA_fast"] = df["Close"].rolling(fast).mean()
     df["SMA_slow"] = df["Close"].rolling(slow).mean()
@@ -122,26 +219,18 @@ def get_signals(symbol: str, fast: int = 10, slow: int = 20):
     df.loc[df["SMA_fast"] < df["SMA_slow"], "Signal"] = -1
 
     # ---------------------------------------------------------
-    # Prepare the last 20 rows with required columns
+    # Prepare the last 20 rows with required columns and proper date formatting
     # ---------------------------------------------------------
-    # Get the last 20 rows, reset index, and format properly
-    result_df = df[["Close", "SMA_fast", "SMA_slow", "Signal"]].tail(20).reset_index()
+    result_df = df[["Date", "Close", "SMA_fast", "SMA_slow", "Signal"]].tail(20).copy()
     
-    # Ensure proper column naming (Date should be the first column after reset_index)
-    result_df.columns = ["Date", "Close", "SMA_fast", "SMA_slow", "Signal"]
-    
-    # Format the Date column as string
+    # Ensure Date is datetime and format as string
+    result_df["Date"] = pd.to_datetime(result_df["Date"])
     result_df["Date"] = result_df["Date"].dt.strftime("%Y-%m-%d")
     
-    # Convert to dictionary format
-    result = {
-        "symbol": symbol,
-        "fast": fast,
-        "slow": slow,
-        "signals": result_df.to_dict(orient="records")
-    }
-
-    return result
+    # Convert to the requested JSON array format
+    signals_array = result_df.to_dict(orient="records")
+    
+    return signals_array
 
 @app.get("/api/market_data")
 async def get_market_data(symbol: str):

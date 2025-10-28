@@ -26,7 +26,7 @@ def init_db():
         
         print("✅ SUCCESS: Database tables ready!")
         print("📋 Available tables:")
-        expected_tables = ["market_data", "signals", "trades", "episodes", "training_runs", "models", "users", "order_trades"]
+        expected_tables = ["market_data", "signals", "trades", "episodes", "training_runs", "models", "users", "order_trades", "portfolios"]
         
         for table in expected_tables:
             if table in tables:
