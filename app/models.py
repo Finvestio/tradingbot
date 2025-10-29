@@ -110,3 +110,47 @@ class OrderTrade(Base):
     price = Column(Float)
     qty = Column(Float)
     user = relationship("User", back_populates="trades")
+
+# MySQL Trading Bot Models (for direct MySQL connector usage)
+# These are for documentation - actual operations use mysql.connector directly
+
+class BotOrder:
+    """
+    MySQL Orders table structure:
+    - id: INT AUTO_INCREMENT PRIMARY KEY
+    - user_id: INT NOT NULL (FK to users.id)
+    - symbol: VARCHAR(20) NOT NULL
+    - asset_type: ENUM('stock', 'crypto', 'derivative') NOT NULL
+    - side: ENUM('BUY', 'SELL') NOT NULL
+    - price: DECIMAL(10,2) NOT NULL
+    - quantity: INT NOT NULL
+    - timestamp: DATETIME DEFAULT CURRENT_TIMESTAMP
+    """
+    pass
+
+class BotPortfolio:
+    """
+    MySQL Portfolio table structure:
+    - id: INT AUTO_INCREMENT PRIMARY KEY  
+    - user_id: INT NOT NULL (FK to users.id)
+    - symbol: VARCHAR(20) NOT NULL
+    - asset_type: ENUM('stock', 'crypto', 'derivative') NOT NULL
+    - quantity: INT DEFAULT 0
+    - avg_price: DECIMAL(10,2) DEFAULT 0.00
+    - created_at: TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    - updated_at: TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    - UNIQUE KEY: (user_id, symbol, asset_type)
+    """
+    pass
+
+class BotUser:
+    """
+    MySQL Users table structure (enhanced):
+    - id: INT AUTO_INCREMENT PRIMARY KEY
+    - username: VARCHAR(50) NOT NULL UNIQUE
+    - email: VARCHAR(100) NOT NULL UNIQUE  
+    - wallet_balance: DECIMAL(15,2) DEFAULT 100000.00
+    - created_at: TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    - updated_at: TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    """
+    pass

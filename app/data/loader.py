@@ -9,16 +9,35 @@ from dotenv import load_dotenv
 load_dotenv()
 API_KEY = os.getenv("TWELVEDATA_API_KEY", "f5206f280321485f9fe877095108faac")
 
-def fetch_from_api(symbol: str) -> pd.DataFrame:
+def fetch_from_api(symbol: str, asset_type: str = "stock", interval: str = "1day", outputsize: int = 5000) -> pd.DataFrame:
     """
     Fetches daily prices from Twelve Data free endpoint.
     Ensures proper datetime index for consistency.
+    Supports different asset types.
     """
-    print(f"📡 Fetching {symbol} data from Twelve Data ...")
-    url = (
-        f"https://api.twelvedata.com/time_series"
-        f"?symbol={symbol}&interval=1day&outputsize=5000&apikey={API_KEY}"
-    )
+    print(f"📡 Fetching {symbol} ({asset_type}) data from Twelve Data ...")
+    
+    # Modify URL based on asset type
+    if asset_type == "crypto":
+        # For crypto, ensure we have the proper format
+        if "/" not in symbol:
+            symbol = f"{symbol}/USD"
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={API_KEY}"
+        )
+    elif asset_type == "derivative":
+        # For derivatives, use same logic or add specific handling
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={API_KEY}"
+        )
+    else:  # stock
+        url = (
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={API_KEY}"
+        )
+    
     r = requests.get(url)
     data = r.json()
 
@@ -52,9 +71,15 @@ def save_to_db(symbol: str, df: pd.DataFrame):
         db.commit()
 
 
-def load_market_data(symbol: str, start=None, end=None) -> pd.DataFrame:
+def load_market_data(symbol: str, asset_type: str = "stock", interval: str = "1day", outputsize: int = 5000, start=None, end=None) -> pd.DataFrame:
+    """
+    Load market data with support for different asset types
+    """
+    # Create a unique key for caching that includes asset type
+    cache_key = f"{symbol}_{asset_type}" if asset_type != "stock" else symbol
+    
     with SessionLocal() as db:
-        rows = db.query(MarketData).filter(MarketData.symbol == symbol).all()
+        rows = db.query(MarketData).filter(MarketData.symbol == cache_key).all()
         if rows:
             df = pd.DataFrame([(r.date, r.close) for r in rows], columns=["Date", "Close"])
             # Ensure Date column is datetime before setting as index
@@ -62,9 +87,9 @@ def load_market_data(symbol: str, start=None, end=None) -> pd.DataFrame:
             df.set_index("Date", inplace=True)
             # Sort by date to ensure chronological order
             df.sort_index(inplace=True)
-            print(f"💾 Loaded {len(df)} cached rows for {symbol}.")
+            print(f"💾 Loaded {len(df)} cached rows for {cache_key}.")
             return df
     # Fetch then store
-    df = fetch_from_api(symbol)
-    save_to_db(symbol, df)
+    df = fetch_from_api(symbol, asset_type, interval, outputsize)
+    save_to_db(cache_key, df)  # Save with cache_key to differentiate asset types
     return df
