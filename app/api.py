@@ -12,6 +12,11 @@ from threading import Thread
 import time
 import queue
 import json
+import threading
+import asyncio
+from app.bot.rl_trader import RLTrader
+from fastapi import WebSocket, WebSocketDisconnect
+
 
 # Import dependencies with proper error handling
 from app.data.loader import load_market_data
@@ -64,18 +69,33 @@ notification_queues = {}
 # Initialize database tables on startup
 init_database()
 
-def send_notification(user_id: int, message: str):
+def send_notification(user_id: int, message: str, trade_data: dict = None):
     """
-    Send real-time notification to user via Server-Sent Events
+    Send real-time notification to user via Server-Sent Events and WebSocket
     """
+    # Send via SSE (existing functionality)
     if user_id in notification_queues:
         try:
             notification_queues[user_id].put_nowait(message)
-            print(f"📡 Notification sent to user {user_id}: {message}")
+            print(f"📡 SSE notification sent to user {user_id}: {message}")
         except queue.Full:
             print(f"⚠️ Notification queue full for user {user_id}")
     else:
-        print(f"📭 No active notification stream for user {user_id}")
+        print(f"📭 No active SSE stream for user {user_id}")
+    
+    # Store WebSocket messages for later sending
+    if trade_data and user_id in active_connections:
+        try:
+            # Initialize WebSocket message queue if needed
+            if not hasattr(send_notification, 'ws_messages'):
+                send_notification.ws_messages = {}
+            if user_id not in send_notification.ws_messages:
+                send_notification.ws_messages[user_id] = queue.Queue()
+            
+            send_notification.ws_messages[user_id].put_nowait(trade_data)
+            print(f"📡 WebSocket message queued for user {user_id}: {trade_data}")
+        except Exception as e:
+            print(f"❌ Failed to queue WebSocket message: {e}")
 
 # -------------------------------------------------------------
 # CORS configuration
@@ -522,8 +542,18 @@ def start_bot(payload: dict):
                                     print(f"   💰 Wallet: ${wallet:,.2f}")
                                     print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
                                     
-                                    # Send notification
-                                    send_notification(user_id, trade_message)
+                                    # Send notification with WebSocket data
+                                    trade_data = {
+                                        "type": "trade",
+                                        "action": "BUY",
+                                        "symbol": symbol,
+                                        "price": current_price,
+                                        "quantity": quantity_to_buy,
+                                        "reward": -cost,  # Negative because we spent money
+                                        "equity": wallet,
+                                        "timestamp": time.time()
+                                    }
+                                    send_notification(user_id, trade_message, trade_data)
                                 else:
                                     print(f"❌ Failed to execute BUY order for user {user_id}")
                             else:
@@ -535,8 +565,18 @@ def start_bot(payload: dict):
                                 print(f"   💰 Wallet: ${wallet:,.2f}")
                                 print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
                                 
-                                # Send notification
-                                send_notification(user_id, trade_message)
+                                # Send notification with WebSocket data
+                                trade_data = {
+                                    "type": "trade",
+                                    "action": "BUY",
+                                    "symbol": symbol,
+                                    "price": current_price,
+                                    "quantity": quantity_to_buy,
+                                    "reward": -cost,  # Negative because we spent money
+                                    "equity": wallet,
+                                    "timestamp": time.time()
+                                }
+                                send_notification(user_id, trade_message, trade_data)
                     
                     elif sma_fast < sma_slow:
                         # Check if user has position to sell (or simulate if MySQL not available)
@@ -570,8 +610,18 @@ def start_bot(payload: dict):
                                     print(f"   💰 Wallet: ${wallet:,.2f}")
                                     print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
                                     
-                                    # Send notification
-                                    send_notification(user_id, trade_message)
+                                    # Send notification with WebSocket data
+                                    trade_data = {
+                                        "type": "trade",
+                                        "action": "SELL",
+                                        "symbol": symbol,
+                                        "price": current_price,
+                                        "quantity": quantity_to_sell,
+                                        "reward": revenue,  # Positive because we gained money
+                                        "equity": wallet,
+                                        "timestamp": time.time()
+                                    }
+                                    send_notification(user_id, trade_message, trade_data)
                                 else:
                                     print(f"❌ Failed to execute SELL order for user {user_id}")
                             else:
@@ -582,8 +632,18 @@ def start_bot(payload: dict):
                                 print(f"🔴 {trade_message} (SIMULATION MODE)")
                                 print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
                                 
-                                # Send notification
-                                send_notification(user_id, trade_message)
+                                # Send notification with WebSocket data
+                                trade_data = {
+                                    "type": "trade",
+                                    "action": "SELL",
+                                    "symbol": symbol,
+                                    "price": current_price,
+                                    "quantity": quantity_to_sell,
+                                    "reward": revenue,  # Positive because we gained money
+                                    "equity": 100000.0,  # Simulated wallet value
+                                    "timestamp": time.time()
+                                }
+                                send_notification(user_id, trade_message, trade_data)
                         else:
                             # HOLD - No position to sell
                             if MYSQL_AVAILABLE:
@@ -803,3 +863,204 @@ def get_portfolio_summary(user_id: int):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching portfolio summary: {str(e)}")
+
+running_bots = {}
+
+@app.post("/api/start_bot")
+def start_bot(payload: dict):
+    """
+    Start the RL trading bot for a user and asset.
+    Example:
+    {
+        "user_id": 1,
+        "symbol": "AAPL",
+        "asset_type": "stock",
+        "interval_sec": 1800
+    }
+    """
+    user_id = payload.get("user_id")
+    symbol = payload.get("symbol")
+    asset_type = payload.get("asset_type", "stock")
+    interval_sec = int(payload.get("interval_sec", 1800))
+
+    if not user_id or not symbol:
+        raise HTTPException(status_code=400, detail="user_id and symbol are required")
+
+    key = f"{user_id}_{symbol}_{asset_type}"
+    if key in running_bots:
+        raise HTTPException(status_code=400, detail="Bot already running for this user/asset")
+
+    bot = RLTrader(user_id, symbol, asset_type, interval_sec)
+    thread = threading.Thread(target=bot.run, daemon=True)
+    thread.start()
+    running_bots[key] = bot
+
+    return {"status": "started", "symbol": symbol, "asset_type": asset_type, "user_id": user_id}
+
+
+@app.post("/api/stop_bot")
+def stop_bot(payload: dict):
+    """
+    Stop a running bot by user and symbol.
+    Example: {"user_id": 1, "symbol": "AAPL", "asset_type": "stock"}
+    """
+    user_id = payload.get("user_id")
+    symbol = payload.get("symbol")
+    asset_type = payload.get("asset_type", "stock")
+
+    key = f"{user_id}_{symbol}_{asset_type}"
+    bot = running_bots.pop(key, None)
+    if not bot:
+        raise HTTPException(status_code=404, detail="No bot running for this user/asset")
+
+    print(f"🛑 Bot stopped for {symbol} ({asset_type}) — user {user_id}")
+    return {"status": "stopped", "symbol": symbol}
+
+@app.post("/api/trade_response")
+def trade_response(payload: dict):
+    """
+    Handle user response to trade proposal (accept or reject).
+    Expected payload: {user_id, symbol, decision: "accept"|"reject"}
+    """
+    from app.bot.rl_trader import trade_proposals
+    
+    user_id = payload.get("user_id")
+    symbol = payload.get("symbol")
+    decision = payload.get("decision")
+    
+    if not user_id or not symbol or not decision:
+        raise HTTPException(status_code=400, detail="user_id, symbol, and decision are required")
+    
+    if decision not in ["accept", "reject"]:
+        raise HTTPException(status_code=400, detail="decision must be 'accept' or 'reject'")
+    
+    # Find the proposal
+    key = (user_id, symbol)
+    if key not in trade_proposals:
+        raise HTTPException(status_code=404, detail="No pending trade proposal found")
+    
+    proposal = trade_proposals[key]
+    
+    if decision == "accept":
+        # Execute the trade
+        try:
+            # Get the RLTrader instance (we'll create a temporary one for execution)
+            trader = RLTrader(user_id, symbol, proposal["asset_type"])
+            success = trader.execute_approved_trade(proposal)
+            
+            if success:
+                # Remove proposal after successful execution
+                del trade_proposals[key]
+                print(f"✅ Trade approved and executed for user {user_id}: {proposal['action']} {symbol}")
+                return {"status": "executed", "message": "Trade executed successfully"}
+            else:
+                return {"status": "error", "message": "Failed to execute trade"}
+                
+        except Exception as e:
+            print(f"❌ Error executing approved trade: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to execute trade: {str(e)}")
+    
+    else:  # decision == "reject"
+        # Remove proposal and log rejection - NO EXECUTION HAPPENS
+        del trade_proposals[key]
+        action_name = {1: "BUY", 2: "SELL", 0: "HOLD"}.get(proposal["action"], "UNKNOWN")
+        print(f"❌ TRADE REJECTED → User {user_id} rejected {action_name} {symbol} @ ${proposal.get('price', 0):.2f}")
+        print(f"❌ No trade execution - proposal discarded")
+        
+        # Send rejection notification
+        rejection_msg = {
+            "type": "rejected",
+            "user_id": user_id,
+            "symbol": symbol,
+            "action": proposal["action"],
+            "timestamp": time.time()
+        }
+        
+        # Send via existing notification system
+        send_notification(user_id, f"Trade rejected: {action_name} {symbol}", rejection_msg)
+        
+        return {"status": "rejected", "message": f"{action_name} proposal rejected - no execution"}
+
+@app.post("/api/test_proposal")
+def test_proposal(payload: dict):
+    """Create a test trade proposal for debugging."""
+    user_id = payload.get("user_id", 1)
+    symbol = payload.get("symbol", "AAPL")
+    
+    # Create test proposal
+    proposal = {
+        "type": "proposal",
+        "user_id": user_id,
+        "symbol": symbol,
+        "asset_type": "stock",
+        "action": 1,  # BUY
+        "price": 150.00,
+        "equity": 10000.00,
+        "timestamp": time.time()
+    }
+    
+    # Debug active connections
+    print(f"🧪 Test proposal for user {user_id}")
+    print(f"🧪 Active WebSocket connections: {list(active_connections.keys())}")
+    
+    # Send via WebSocket if connected
+    ws = active_connections.get(user_id)
+    if ws:
+        try:
+            import asyncio
+            proposal_json = json.dumps(proposal)
+            
+            # Try to send the message
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(ws.send_text(proposal_json))
+            loop.close()
+            
+            print(f"✅ Test proposal sent successfully to user {user_id}")
+            print(f"📋 Proposal content: {proposal_json}")
+            return {"status": "sent", "proposal": proposal, "message": "Test proposal sent via WebSocket"}
+            
+        except Exception as e:
+            error_msg = f"Failed to send test proposal: {str(e)}"
+            print(f"❌ {error_msg}")
+            return {"status": "error", "message": error_msg}
+    else:
+        error_msg = f"User {user_id} not connected via WebSocket. Active connections: {list(active_connections.keys())}"
+        print(f"❌ {error_msg}")
+        return {"status": "error", "message": error_msg}
+
+active_connections = {}
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: int):
+    await websocket.accept()
+    active_connections[user_id] = websocket
+    print(f"🔌 User {user_id} connected via WebSocket")
+    try:
+        while True:
+            # Check for queued messages to send
+            if (hasattr(send_notification, 'ws_messages') and 
+                user_id in send_notification.ws_messages and 
+                not send_notification.ws_messages[user_id].empty()):
+                try:
+                    message = send_notification.ws_messages[user_id].get_nowait()
+                    await websocket.send_text(json.dumps(message))
+                    print(f"📡 WebSocket message sent to user {user_id}: {message}")
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    print(f"❌ Failed to send WebSocket message: {e}")
+            
+            # Small delay to prevent busy waiting
+            await asyncio.sleep(0.1)
+            
+            # Try to receive (non-blocking) to detect disconnections
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass  # No message received, continue loop
+                
+    except WebSocketDisconnect:
+        if user_id in active_connections:
+            del active_connections[user_id]
+        print(f"❌ User {user_id} disconnected")
