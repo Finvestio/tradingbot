@@ -26,5 +26,5 @@ def example_state(symbol="AAPL", asset_type="stock", window=30):
     df = load_bars_from_db(symbol, asset_type)
     idx = len(df)-1
     s = state_from_row(df, idx, window, position=0, cash_ratio=1.0)
-    print("State shape:", s.shape)
+
     return s

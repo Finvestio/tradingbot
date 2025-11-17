@@ -1,0 +1,40 @@
+{
+  "strategy": "mean-reversion",
+  "customStrategy": null,
+  "frequency": "low",
+  "assetClass": "equities",
+  "specificSymbols": [
+    "AAPPL"
+  ],
+  "useDefault357Rule": false,
+  "riskPerTrade": 5.0,
+  "maxPortfolioExposure": 3.0,
+  "riskRewardRatio": "1:1",
+  "riskTolerance": "aggressive",
+  "timeframes": [
+    "1h",
+    "1min"
+  ],
+  "rewardStrategy": "risk_adjusted",
+  "customRewardWeights": {
+    "profit": 0.4,
+    "risk": 0.3,
+    "drawdown": 0.2,
+    "volatility": 0.1
+  },
+  "continuousLearning": true,
+  "retrainingFrequency": "after_trade",
+  "features": {
+    "realTimeAlerts": true,
+    "autoPositionScaling": true,
+    "stopLossTakeProfit": true,
+    "portfolioRebalancing": false
+  },
+  "indicators": [
+    "RSI",
+    "MACD",
+    "SMA_FAST",
+    "SMA_SLOW"
+  ],
+  "customIndicators": []
+}

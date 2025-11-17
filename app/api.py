@@ -51,6 +51,13 @@ except ImportError:
     print("⚠️ Orders router not available - continuing without it")
     orders_router = None
 
+# Try to import RL configuration router
+try:
+    from app.api_rl_config import router as rl_config_router
+except ImportError:
+    print("⚠️ RL Config router not available - continuing without it")
+    rl_config_router = None
+
 app = FastAPI(title="Trading Bot API")
 
 # Register the orders router if available
@@ -60,11 +67,27 @@ if orders_router:
 else:
     print("⚠️ Orders router not available - skipping registration")
 
+# Register the RL configuration router if available
+if rl_config_router:
+    app.include_router(rl_config_router)
+    print("✅ RL Configuration router registered")
+else:
+    print("⚠️ RL Configuration router not available - skipping registration")
+
 # Global dictionary to track active trading bots
 active_bots = {}
 
 # Global dictionary to track notification queues for Server-Sent Events
 notification_queues = {}
+
+# Global dictionary to track pending trade proposals waiting for user approval
+pending_proposals = {}
+
+# Global dictionary to track WebSocket message queues
+ws_message_queues = {}
+
+# Global dictionary to track active WebSocket connections
+active_connections = {}
 
 # Initialize database tables on startup
 init_database()
@@ -77,25 +100,22 @@ def send_notification(user_id: int, message: str, trade_data: dict = None):
     if user_id in notification_queues:
         try:
             notification_queues[user_id].put_nowait(message)
-            print(f"📡 SSE notification sent to user {user_id}: {message}")
         except queue.Full:
-            print(f"⚠️ Notification queue full for user {user_id}")
-    else:
-        print(f"📭 No active SSE stream for user {user_id}")
+            pass
     
     # Store WebSocket messages for later sending
-    if trade_data and user_id in active_connections:
+    if trade_data:
         try:
             # Initialize WebSocket message queue if needed
-            if not hasattr(send_notification, 'ws_messages'):
-                send_notification.ws_messages = {}
-            if user_id not in send_notification.ws_messages:
-                send_notification.ws_messages[user_id] = queue.Queue()
+            if user_id not in ws_message_queues:
+                ws_message_queues[user_id] = queue.Queue(maxsize=100)
             
-            send_notification.ws_messages[user_id].put_nowait(trade_data)
-            print(f"📡 WebSocket message queued for user {user_id}: {trade_data}")
+            ws_message_queues[user_id].put_nowait(trade_data)
+            print(f"📨 Queued WebSocket message for user {user_id}: {trade_data.get('type', 'unknown')}")
+        except queue.Full:
+            print(f"⚠️ WebSocket message queue full for user {user_id}")
         except Exception as e:
-            print(f"❌ Failed to queue WebSocket message: {e}")
+            print(f"❌ Error queuing WebSocket message: {e}")
 
 # -------------------------------------------------------------
 # CORS configuration
@@ -206,10 +226,31 @@ def get_chart_data(symbol: str, asset_type: str = "stock", interval: str = "1day
     """
     Fetch dynamic market data from TwelveData for the chosen asset type and symbol.
     Returns formatted data with SMA calculations for live charts.
+    Always fetches fresh data from API to ensure real-time accuracy.
     """
     try:
-        # Load market data using the updated function
-        df = load_market_data(symbol, asset_type, interval, outputsize)
+        # Force fresh fetch from API instead of using stale cache
+        from app.data.loader import fetch_from_api, save_to_db
+        print(f"🔄 Fetching fresh chart data for {symbol} ({asset_type}) from API...")
+        
+        try:
+            # Fetch fresh data from API
+            df = fetch_from_api(symbol, asset_type, interval, outputsize)
+            # Update cache with fresh data
+            cache_key = f"{symbol}_{asset_type}" if asset_type != "stock" else symbol
+            save_to_db(cache_key, df)
+            print(f"✅ Fresh data fetched and cached: {len(df)} rows")
+        except Exception as e:
+            print(f"⚠️ Fresh fetch failed: {e}, trying cached data...")
+            # Fallback to cached data if API fails
+            df = load_market_data(symbol, asset_type, interval, outputsize)
+        
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No market data found for {asset_type}:{symbol}")
+        
+        # Ensure we have Close column
+        if "Close" not in df.columns:
+            raise HTTPException(status_code=500, detail="Invalid data format: missing Close column")
         
         # Calculate SMAs
         df["SMA_fast"] = df["Close"].rolling(10).mean()
@@ -224,13 +265,31 @@ def get_chart_data(symbol: str, asset_type: str = "stock", interval: str = "1day
         # Convert to records format, ensuring datetime is serializable
         records = []
         for _, row in df_reset.iterrows():
+            # Handle Date column
+            date_val = row.get("Date", None)
+            if date_val is None or pd.isna(date_val):
+                continue
+                
+            if hasattr(date_val, 'strftime'):
+                date_str = date_val.strftime("%Y-%m-%d")
+            else:
+                date_str = str(date_val)
+            
+            # Handle Close price
+            close_val = row.get("Close", None)
+            if close_val is None or pd.isna(close_val):
+                continue
+            
             record = {
-                "Date": row["Date"].strftime("%Y-%m-%d") if hasattr(row["Date"], 'strftime') else str(row["Date"]),
-                "Close": float(row["Close"]) if not pd.isna(row["Close"]) else None,
-                "SMA_fast": float(row["SMA_fast"]) if not pd.isna(row["SMA_fast"]) else None,
-                "SMA_slow": float(row["SMA_slow"]) if not pd.isna(row["SMA_slow"]) else None
+                "Date": date_str,
+                "Close": float(close_val),
+                "SMA_fast": float(row["SMA_fast"]) if not pd.isna(row.get("SMA_fast")) else None,
+                "SMA_slow": float(row["SMA_slow"]) if not pd.isna(row.get("SMA_slow")) else None
             }
             records.append(record)
+        
+        if not records:
+            raise HTTPException(status_code=404, detail=f"No valid data points found for {asset_type}:{symbol}")
         
         return {
             "symbol": symbol,
@@ -238,7 +297,11 @@ def get_chart_data(symbol: str, asset_type: str = "stock", interval: str = "1day
             "data": records
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching chart data: {str(e)}")
 
 # -------------------------------------------------------------
@@ -269,9 +332,20 @@ def run_strategy(payload: dict):
     # Log user activity
     print(f"Running strategy for user {user_id} on {asset_type}:{symbol}")
 
-    # Load market data with asset type support
+    # Load market data with asset type support - force fresh fetch
     try:
-        df = load_market_data(symbol, asset_type)
+        # Force fresh fetch from API to ensure current data
+        from app.data.loader import fetch_from_api, save_to_db
+        try:
+            df = fetch_from_api(symbol, asset_type, interval="1day", outputsize=5000)
+            # Update cache
+            cache_key = f"{symbol}_{asset_type}" if asset_type != "stock" else symbol
+            save_to_db(cache_key, df)
+            print(f"🔄 Fresh data fetched for strategy analysis: {len(df)} rows")
+        except Exception as e:
+            print(f"⚠️ Fresh fetch failed: {e}, using cached data")
+            df = load_market_data(symbol, asset_type)
+        
         if df is None or df.empty:
             raise HTTPException(status_code=404, detail=f"No market data found for {asset_type}:{symbol}")
     except Exception as e:
@@ -347,9 +421,18 @@ def get_signals(symbol: str, fast: int = 10, slow: int = 20):
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
 
-    # Load market data
+    # Load market data - force fresh fetch for signals
     try:
-        df = load_market_data(symbol)
+        from app.data.loader import fetch_from_api, save_to_db
+        try:
+            # Fetch fresh data for signals
+            df = fetch_from_api(symbol, "stock", interval="1day", outputsize=5000)
+            save_to_db(symbol, df)
+            print(f"🔄 Fresh data fetched for signals: {len(df)} rows")
+        except Exception as e:
+            print(f"⚠️ Fresh fetch failed: {e}, using cached data")
+            df = load_market_data(symbol)
+        
         if df is None or df.empty:
             raise HTTPException(status_code=404, detail=f"No market data found for symbol {symbol}")
     except Exception as e:
@@ -391,16 +474,35 @@ def get_signals(symbol: str, fast: int = 10, slow: int = 20):
     
     return signals_array
 
-@app.get("/api/market_data")
-async def get_market_data(symbol: str):
+@app.get("/api/realtime_price")
+def get_realtime_price(symbol: str, asset_type: str = "stock"):
     """
-    Get cached market data for a symbol from MySQL database
+    Get real-time price quote from Twelve Data API
     """
     try:
-        df = load_market_data(symbol)
+        from app.data.loader import fetch_realtime_price
+        price_data = fetch_realtime_price(symbol, asset_type)
+        return price_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching real-time price: {str(e)}")
+
+@app.get("/api/market_data")
+async def get_market_data(symbol: str, asset_type: str = "stock"):
+    """
+    Get cached market data for a symbol from MySQL database, or fetch from API if not cached
+    """
+    try:
+        # Try to load from cache first
+        df = load_market_data(symbol, asset_type)
         
         if df is None or df.empty:
-            raise HTTPException(status_code=404, detail=f"No market data found for symbol {symbol}")
+            # If no cached data, fetch fresh from API
+            print(f"⚠️ No cached data for {symbol}, fetching from API...")
+            from app.data.loader import fetch_from_api
+            df = fetch_from_api(symbol, asset_type, interval="1day", outputsize=100)
+            # Save to cache
+            from app.data.loader import save_to_db
+            save_to_db(symbol, df)
         
         # Reset index to make sure Date is a column
         if df.index.name == 'Date' or 'Date' not in df.columns:
@@ -420,14 +522,21 @@ async def get_market_data(symbol: str):
             else:
                 date_str = str(date_val)
             
+            # Get values with fallbacks
+            open_val = row.get('Open', row.get('open', row.get('Close', row.get('close', 0))))
+            high_val = row.get('High', row.get('high', row.get('Close', row.get('close', 0))))
+            low_val = row.get('Low', row.get('low', row.get('Close', row.get('close', 0))))
+            close_val = row.get('Close', row.get('close', 0))
+            volume_val = row.get('Volume', row.get('volume', 0))
+            
             market_data.append({
                 "symbol": symbol.upper(),
                 "date": date_str,
-                "open": float(row.get('Open', row.get('open', 0))),
-                "high": float(row.get('High', row.get('high', 0))),
-                "low": float(row.get('Low', row.get('low', 0))),
-                "close": float(row.get('Close', row.get('close', 0))),
-                "volume": int(row.get('Volume', row.get('volume', 0)))
+                "open": float(open_val) if not pd.isna(open_val) else float(close_val),
+                "high": float(high_val) if not pd.isna(high_val) else float(close_val),
+                "low": float(low_val) if not pd.isna(low_val) else float(close_val),
+                "close": float(close_val),
+                "volume": int(volume_val) if not pd.isna(volume_val) else 0
             })
         
         return market_data
@@ -438,11 +547,12 @@ async def get_market_data(symbol: str):
         raise HTTPException(status_code=500, detail=f"Error retrieving market data: {str(e)}")
 
 # -------------------------------------------------------------
-# Automated Trading Bot Endpoints
+# Automated Trading Bot Endpoints (DEPRECATED - Use RL Bot below)
 # -------------------------------------------------------------
+# This old SMA bot endpoint is DISABLED - RL bot is used instead
 
-@app.post("/api/start_bot")
-def start_bot(payload: dict):
+@app.post("/api/start_bot_OLD_DISABLED")  # RENAMED - Old SMA bot (not used)
+def start_bot_old_sma(payload: dict):
     """
     Start an automated trading bot for the specified user, asset type, and symbol.
     The bot runs SMA crossover strategy and executes trades every 30 seconds.
@@ -451,12 +561,14 @@ def start_bot(payload: dict):
     {
         "symbol": "AAPL",
         "asset_type": "stock",
-        "user_id": 1
+        "user_id": 1,
+        "auto_execute": false  # If true, bot executes trades automatically without user approval
     }
     """
     symbol = payload.get("symbol")
     asset_type = payload.get("asset_type", "stock")
     user_id = payload.get("user_id")
+    auto_execute = payload.get("auto_execute", False)  # Default to manual approval
 
     if not symbol or not user_id:
         raise HTTPException(status_code=400, detail="Symbol and user_id are required")
@@ -469,6 +581,7 @@ def start_bot(payload: dict):
         """
         Main bot loop that runs SMA crossover strategy every 30 seconds
         Enhanced with MySQL database integration for real portfolio management
+        Can execute trades automatically or wait for user approval based on auto_execute flag
         """
         try:
             # Get user's current wallet balance from database or use default
@@ -483,13 +596,24 @@ def start_bot(payload: dict):
             fast_period = 10
             slow_period = 20
             
-            print(f"🤖 Bot started for user {user_id} trading {asset_type}:{symbol}")
-            print(f"💰 Current wallet: ${wallet:,.2f}")
-            
             while user_id in active_bots:
                 try:
-                    # Fetch latest market data
+                    # Fetch latest market data (force fresh fetch for real-time trading)
+                    from app.data.loader import fetch_from_api, save_to_db
                     df = load_market_data(symbol, asset_type)
+                    
+                    # Force refresh: fetch fresh data from API to ensure we have latest prices
+                    try:
+                        fresh_df = fetch_from_api(symbol, asset_type, interval="1day", outputsize=100)
+                        if not fresh_df.empty:
+                            # Update cache with fresh data
+                            cache_key = f"{symbol}_{asset_type}" if asset_type != "stock" else symbol
+                            save_to_db(cache_key, fresh_df)
+                            df = fresh_df
+                            print(f"🔄 Refreshed market data from API for {symbol}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to refresh data from API: {e}, using cached data")
+                    
                     if df is None or df.empty:
                         print(f"❌ No market data available for {asset_type}:{symbol}")
                         time.sleep(30)
@@ -499,15 +623,22 @@ def start_bot(payload: dict):
                     df["SMA_fast"] = df["Close"].rolling(fast_period).mean()
                     df["SMA_slow"] = df["Close"].rolling(slow_period).mean()
                     
-                    # Get the latest data point
+                    # Get REAL-TIME price instead of last cached price
+                    try:
+                        from app.data.loader import fetch_realtime_price
+                        realtime_data = fetch_realtime_price(symbol, asset_type)
+                        current_price = float(realtime_data["price"])
+                    except Exception as e:
+                        latest = df.tail(1).iloc[0]
+                        current_price = float(latest["Close"])
+                    
+                    # Get SMA values from latest data
                     latest = df.tail(1).iloc[0]
-                    current_price = float(latest["Close"])
                     sma_fast = latest["SMA_fast"]
                     sma_slow = latest["SMA_slow"]
                     
                     # Skip if SMAs are not available (not enough data)
                     if pd.isna(sma_fast) or pd.isna(sma_slow):
-                        print(f"⏳ Waiting for SMA data... (need at least {slow_period} data points)")
                         time.sleep(30)
                         continue
                     
@@ -520,66 +651,70 @@ def start_bot(payload: dict):
                     
                     wallet = current_wallet
                     
-                    # SMA Crossover Trading Logic with Database Integration
+                    # SMA Crossover Trading Logic - Auto Execute or Create Proposals
                     if sma_fast > sma_slow and wallet >= current_price:
                         # BUY Signal - Fast SMA above Slow SMA
                         quantity_to_buy = 1
                         cost = quantity_to_buy * current_price
                         
                         if wallet >= cost:
-                            new_wallet = wallet - cost
-                            
-                            # Update database if MySQL is available, otherwise simulate trade
-                            if MYSQL_AVAILABLE:
-                                if (update_user_wallet(user_id, new_wallet) and
-                                    update_portfolio(user_id, symbol, asset_type, quantity_to_buy, current_price, 'BUY') and
-                                    record_order(user_id, symbol, asset_type, 'BUY', current_price, quantity_to_buy)):
+                            if auto_execute:
+                                # Auto-execute the trade immediately
+                                from broker.portfolio import PortfolioManager
+                                portfolio_mgr = PortfolioManager()
+                                
+                                try:
+                                    result = portfolio_mgr.execute_trade(
+                                        user_id=user_id,
+                                        symbol=symbol,
+                                        action="BUY",
+                                        quantity=quantity_to_buy,
+                                        price=current_price,
+                                        asset_type=asset_type
+                                    )
                                     
-                                    wallet = new_wallet
-                                    trade_message = f"BUY {quantity_to_buy} {symbol} @ ${current_price:.2f}"
+                                    print(f"🤖 AUTO-EXECUTED: BUY {quantity_to_buy} {symbol} @ ${current_price:.2f}")
                                     
-                                    print(f"🟢 {trade_message}")
-                                    print(f"   💰 Wallet: ${wallet:,.2f}")
-                                    print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
-                                    
-                                    # Send notification with WebSocket data
-                                    trade_data = {
-                                        "type": "trade",
+                                    # Send execution notification
+                                    send_notification(user_id, f"🤖 Auto-executed BUY {quantity_to_buy} {symbol} @ ${current_price:.2f}", {
+                                        "type": "trade_executed",
                                         "action": "BUY",
                                         "symbol": symbol,
-                                        "price": current_price,
                                         "quantity": quantity_to_buy,
-                                        "reward": -cost,  # Negative because we spent money
-                                        "equity": wallet,
-                                        "timestamp": time.time()
-                                    }
-                                    send_notification(user_id, trade_message, trade_data)
-                                else:
-                                    print(f"❌ Failed to execute BUY order for user {user_id}")
+                                        "price": current_price,
+                                        "result": result
+                                    })
+                                except Exception as e:
+                                    print(f"❌ Auto-execution failed: {e}")
                             else:
-                                # Simulate trade without database
-                                wallet = new_wallet
-                                trade_message = f"BUY {quantity_to_buy} {symbol} @ ${current_price:.2f} (SIMULATED)"
-                                
-                                print(f"🟢 {trade_message}")
-                                print(f"   💰 Wallet: ${wallet:,.2f}")
-                                print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
-                                
-                                # Send notification with WebSocket data
-                                trade_data = {
-                                    "type": "trade",
-                                    "action": "BUY",
+                                # Create trade proposal for user approval
+                                proposal_id = f"proposal_{user_id}_{int(time.time())}_{symbol}"
+                                proposal = {
+                                    "proposal_id": proposal_id,
+                                    "user_id": user_id,
                                     "symbol": symbol,
+                                    "asset_type": asset_type,
+                                    "action": 1,  # BUY
                                     "price": current_price,
                                     "quantity": quantity_to_buy,
-                                    "reward": -cost,  # Negative because we spent money
+                                    "cost": cost,
                                     "equity": wallet,
-                                    "timestamp": time.time()
+                                    "timestamp": time.time(),
+                                    "confidence": abs(sma_fast - sma_slow) / sma_slow  # Signal strength
                                 }
-                                send_notification(user_id, trade_message, trade_data)
+                                
+                                # Store proposal for user approval
+                                pending_proposals[proposal_id] = proposal
+                                
+                                # Send proposal notification via WebSocket
+                                proposal_message = f"🤖 Bot wants to BUY {quantity_to_buy} {symbol} @ ${current_price:.2f} - Your approval needed!"
+                                send_notification(user_id, proposal_message, {
+                                    "type": "trade_proposal",
+                                    "proposal": proposal
+                                })
                     
                     elif sma_fast < sma_slow:
-                        # Check if user has position to sell (or simulate if MySQL not available)
+                        # Check if user has position to sell
                         if MYSQL_AVAILABLE:
                             portfolio = get_user_portfolio(user_id)
                             user_position = None
@@ -588,69 +723,74 @@ def start_bot(payload: dict):
                                     user_position = position
                                     break
                             has_position = user_position and user_position['quantity'] > 0
+                            quantity_available = user_position['quantity'] if user_position else 0
                         else:
-                            # For simulation, assume we have 1 share to sell if we've done a buy before
+                            # For simulation, assume we have 1 share to sell
                             has_position = True  # Simulate having position
+                            quantity_available = 1
                         
                         if has_position:
                             # SELL Signal - Fast SMA below Slow SMA
-                            if MYSQL_AVAILABLE:
-                                quantity_to_sell = min(1, user_position['quantity'])  # Sell 1 or remaining quantity
-                                revenue = quantity_to_sell * current_price
-                                new_wallet = wallet + revenue
+                            quantity_to_sell = min(1, quantity_available)  # Sell 1 or remaining quantity
+                            revenue = quantity_to_sell * current_price
+                            
+                            if auto_execute:
+                                # Auto-execute the trade immediately
+                                from broker.portfolio import PortfolioManager
+                                portfolio_mgr = PortfolioManager()
                                 
-                                # Update database: wallet, portfolio, and orders
-                                if (update_user_wallet(user_id, new_wallet) and
-                                    update_portfolio(user_id, symbol, asset_type, quantity_to_sell, current_price, 'SELL') and
-                                    record_order(user_id, symbol, asset_type, 'SELL', current_price, quantity_to_sell)):
+                                try:
+                                    result = portfolio_mgr.execute_trade(
+                                        user_id=user_id,
+                                        symbol=symbol,
+                                        action="SELL",
+                                        quantity=quantity_to_sell,
+                                        price=current_price,
+                                        asset_type=asset_type
+                                    )
                                     
-                                    wallet = new_wallet
-                                    trade_message = f"SELL {quantity_to_sell} {symbol} @ ${current_price:.2f}"
-                                    print(f"🔴 {trade_message}")
-                                    print(f"   💰 Wallet: ${wallet:,.2f}")
-                                    print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
+                                    print(f"🤖 AUTO-EXECUTED: SELL {quantity_to_sell} {symbol} @ ${current_price:.2f}")
                                     
-                                    # Send notification with WebSocket data
-                                    trade_data = {
-                                        "type": "trade",
+                                    # Send execution notification
+                                    send_notification(user_id, f"🤖 Auto-executed SELL {quantity_to_sell} {symbol} @ ${current_price:.2f}", {
+                                        "type": "trade_executed",
                                         "action": "SELL",
                                         "symbol": symbol,
-                                        "price": current_price,
                                         "quantity": quantity_to_sell,
-                                        "reward": revenue,  # Positive because we gained money
-                                        "equity": wallet,
-                                        "timestamp": time.time()
-                                    }
-                                    send_notification(user_id, trade_message, trade_data)
-                                else:
-                                    print(f"❌ Failed to execute SELL order for user {user_id}")
+                                        "price": current_price,
+                                        "result": result
+                                    })
+                                except Exception as e:
+                                    print(f"❌ Auto-execution failed: {e}")
                             else:
-                                # Simulate SELL order
-                                quantity_to_sell = 1  # Simulate selling 1 share
-                                revenue = quantity_to_sell * current_price
-                                trade_message = f"SIMULATED SELL {quantity_to_sell} {symbol} @ ${current_price:.2f}"
-                                print(f"🔴 {trade_message} (SIMULATION MODE)")
-                                print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
-                                
-                                # Send notification with WebSocket data
-                                trade_data = {
-                                    "type": "trade",
-                                    "action": "SELL",
+                                # Create SELL proposal for user approval
+                                proposal_id = f"proposal_{user_id}_{int(time.time())}_{symbol}"
+                                proposal = {
+                                    "proposal_id": proposal_id,
+                                    "user_id": user_id,
                                     "symbol": symbol,
+                                    "asset_type": asset_type,
+                                    "action": 2,  # SELL
                                     "price": current_price,
                                     "quantity": quantity_to_sell,
-                                    "reward": revenue,  # Positive because we gained money
-                                    "equity": 100000.0,  # Simulated wallet value
-                                    "timestamp": time.time()
+                                    "revenue": revenue,
+                                    "equity": wallet,
+                                    "timestamp": time.time(),
+                                    "confidence": abs(sma_slow - sma_fast) / sma_fast  # Signal strength
                                 }
-                                send_notification(user_id, trade_message, trade_data)
+                                
+                                # Store proposal for user approval
+                                pending_proposals[proposal_id] = proposal
+                                
+                                # Send proposal notification via WebSocket
+                                proposal_message = f"🤖 Bot wants to SELL {quantity_to_sell} {symbol} @ ${current_price:.2f} - Your approval needed!"
+                                send_notification(user_id, proposal_message, {
+                                    "type": "trade_proposal",
+                                    "proposal": proposal
+                                })
                         else:
                             # HOLD - No position to sell
-                            if MYSQL_AVAILABLE:
-                                print(f"⚪ HOLD {symbol} at ${current_price:.2f} | Wallet: ${wallet:,.2f} | No position")
-                            else:
-                                print(f"⚪ HOLD {symbol} at ${current_price:.2f} | No position (SIMULATION MODE)")
-                            print(f"   📊 Fast SMA: ${sma_fast:.2f} | Slow SMA: ${sma_slow:.2f}")
+                            print(f"⚪ HOLD {symbol} - No position to sell")
                     
                     else:
                         # HOLD - No clear signal or insufficient funds
@@ -684,9 +824,10 @@ def start_bot(payload: dict):
         "message": f"Automated trading bot started for user {user_id} on {asset_type}:{symbol}"
     }
 
-@app.post("/api/stop_bot")
-def stop_bot(payload: dict):
+@app.post("/api/stop_bot_OLD_DISABLED")
+def stop_bot_old(payload: dict):
     """
+    OLD ENDPOINT - DISABLED
     Stop the automated trading bot for the specified user.
     
     Expected payload:
@@ -837,6 +978,7 @@ def get_order_history(user_id: int, limit: int = 50):
 def get_portfolio_summary(user_id: int):
     """
     Get comprehensive portfolio summary including wallet, holdings, and recent trades
+    Uses REAL-TIME prices for accurate portfolio valuation
     """
     try:
         # Get wallet balance
@@ -846,7 +988,57 @@ def get_portfolio_summary(user_id: int):
         
         # Get portfolio holdings
         portfolio = get_user_portfolio(user_id)
-        total_holdings_value = sum(float(position['total_value']) for position in portfolio)
+        
+        # Update each holding with real-time prices from Twelve Data API
+        from app.data.loader import fetch_realtime_price
+        updated_holdings = []
+        total_holdings_value = 0.0
+        
+        print(f"📊 Fetching real-time prices for {len(portfolio)} holdings...")
+        
+        for position in portfolio:
+            symbol = position.get('symbol', '')
+            asset_type = position.get('asset_type', 'stock')
+            quantity = float(position.get('quantity', 0))
+            avg_price = float(position.get('avg_price', 0))
+            
+            if not symbol or quantity <= 0:
+                continue
+            
+            # Fetch REAL-TIME price from Twelve Data API
+            current_price = avg_price  # Default fallback
+            price_fetched = False
+            
+            try:
+                realtime_data = fetch_realtime_price(symbol, asset_type)
+                current_price = float(realtime_data["price"])
+                price_fetched = True
+                print(f"✅ Real-time price for {symbol}: ${current_price:.2f} (was avg: ${avg_price:.2f})")
+            except Exception as e:
+                # Fallback to avg_price if real-time fetch fails, but log the error
+                print(f"⚠️ Failed to fetch real-time price for {symbol} ({asset_type}): {e}")
+                print(f"   Using avg_price ${avg_price:.2f} as fallback")
+                current_price = avg_price
+                price_fetched = False
+            
+            # Calculate real-time values using current_price
+            total_value = quantity * current_price
+            unrealized_pnl = (current_price - avg_price) * quantity
+            
+            updated_holdings.append({
+                "symbol": symbol,
+                "asset_type": asset_type,
+                "quantity": quantity,
+                "avg_price": avg_price,
+                "current_price": current_price,
+                "total_value": total_value,
+                "unrealized_pnl": unrealized_pnl,
+                "price_is_realtime": price_fetched  # Flag to indicate if price is real-time
+            })
+            
+            total_holdings_value += total_value
+        
+        print(f"📊 Portfolio updated: {len(updated_holdings)} holdings, total value: ${total_holdings_value:.2f}")
         
         # Get recent orders
         recent_orders = get_user_orders(user_id, 10)
@@ -856,12 +1048,14 @@ def get_portfolio_summary(user_id: int):
             "wallet_balance": wallet,
             "total_holdings_value": total_holdings_value,
             "total_portfolio_value": wallet + total_holdings_value,
-            "holdings": portfolio,
+            "holdings": updated_holdings,
             "recent_orders": recent_orders,
-            "positions_count": len(portfolio)
+            "positions_count": len(updated_holdings)
         }
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching portfolio summary: {str(e)}")
 
 running_bots = {}
@@ -870,18 +1064,21 @@ running_bots = {}
 def start_bot(payload: dict):
     """
     Start the RL trading bot for a user and asset.
+    
     Example:
     {
         "user_id": 1,
         "symbol": "AAPL",
         "asset_type": "stock",
-        "interval_sec": 1800
+        "interval_sec": 30,
+        "auto_execute": true
     }
     """
     user_id = payload.get("user_id")
     symbol = payload.get("symbol")
     asset_type = payload.get("asset_type", "stock")
-    interval_sec = int(payload.get("interval_sec", 1800))
+    interval_sec = int(payload.get("interval_sec", 30))  # Default 30 seconds
+    auto_execute = payload.get("auto_execute", True)  # Default to auto-execute
 
     if not user_id or not symbol:
         raise HTTPException(status_code=400, detail="user_id and symbol are required")
@@ -890,12 +1087,43 @@ def start_bot(payload: dict):
     if key in running_bots:
         raise HTTPException(status_code=400, detail="Bot already running for this user/asset")
 
-    bot = RLTrader(user_id, symbol, asset_type, interval_sec)
-    thread = threading.Thread(target=bot.run, daemon=True)
+    print(f"\n{'='*80}")
+    print(f"🚀 STARTING RL BOT")
+    print(f"{'='*80}")
+    print(f"User ID: {user_id}")
+    print(f"Symbol: {symbol}")
+    print(f"Asset Type: {asset_type}")
+    print(f"Interval: {interval_sec} seconds")
+    print(f"Auto Execute: {auto_execute}")
+    print(f"{'='*80}\n")
+
+    def run_bot_with_error_handling():
+        try:
+            bot.run()
+        except Exception as e:
+            print(f"\n{'!'*80}")
+            print(f"❌ CRITICAL BOT ERROR - Thread crashed!")
+            print(f"{'!'*80}")
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"{'!'*80}\n")
+
+    bot = RLTrader(user_id, symbol, asset_type, interval_sec, auto_execute)
+    thread = threading.Thread(target=run_bot_with_error_handling, daemon=True)
     thread.start()
     running_bots[key] = bot
 
-    return {"status": "started", "symbol": symbol, "asset_type": asset_type, "user_id": user_id}
+    print(f"✅ Bot thread started successfully for {symbol}")
+
+    return {
+        "status": "started", 
+        "symbol": symbol, 
+        "asset_type": asset_type, 
+        "user_id": user_id,
+        "interval_sec": interval_sec,
+        "auto_execute": auto_execute
+    }
 
 
 @app.post("/api/stop_bot")
@@ -983,19 +1211,40 @@ def trade_response(payload: dict):
 
 @app.post("/api/test_proposal")
 def test_proposal(payload: dict):
-    """Create a test trade proposal for debugging."""
+    """Create a test trade proposal for debugging with REAL-TIME prices from Twelve Data API."""
     user_id = payload.get("user_id", 1)
     symbol = payload.get("symbol", "AAPL")
+    asset_type = payload.get("asset_type", "stock")
     
-    # Create test proposal
+    # ✅ FETCH REAL-TIME PRICE FROM TWELVE DATA API
+    try:
+        from app.data.loader import fetch_realtime_price
+        from app.db import get_user_wallet
+        
+        realtime_data = fetch_realtime_price(symbol, asset_type)
+        current_price = float(realtime_data["price"])
+        
+        # Get user's current equity/wallet
+        wallet = get_user_wallet(user_id)
+        current_equity = wallet if wallet is not None else 10000.00
+        
+        print(f"📡 Test proposal: Fetched real-time price ${current_price:.2f} for {symbol} from Twelve Data API")
+    except Exception as e:
+        print(f"⚠️ Failed to fetch real-time price for test proposal: {e}")
+        # Fallback to a default price (but log the error)
+        current_price = 150.00
+        current_equity = 10000.00
+        print(f"⚠️ Using fallback price ${current_price:.2f} (API fetch failed)")
+    
+    # Create test proposal with REAL-TIME price
     proposal = {
         "type": "proposal",
         "user_id": user_id,
         "symbol": symbol,
-        "asset_type": "stock",
+        "asset_type": asset_type,
         "action": 1,  # BUY
-        "price": 150.00,
-        "equity": 10000.00,
+        "price": current_price,  # ✅ REAL-TIME PRICE FROM API
+        "equity": current_equity,
         "timestamp": time.time()
     }
     
@@ -1016,8 +1265,7 @@ def test_proposal(payload: dict):
             loop.run_until_complete(ws.send_text(proposal_json))
             loop.close()
             
-            print(f"✅ Test proposal sent successfully to user {user_id}")
-            print(f"📋 Proposal content: {proposal_json}")
+            print("✅ Test proposal sent successfully to user {user_id}")
             return {"status": "sent", "proposal": proposal, "message": "Test proposal sent via WebSocket"}
             
         except Exception as e:
@@ -1029,38 +1277,130 @@ def test_proposal(payload: dict):
         print(f"❌ {error_msg}")
         return {"status": "error", "message": error_msg}
 
-active_connections = {}
-
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: int):
     await websocket.accept()
     active_connections[user_id] = websocket
-    print(f"🔌 User {user_id} connected via WebSocket")
+    print(f"✅ WebSocket connected for user {user_id}")
+    
+    # Initialize message queue for this user if not exists
+    if user_id not in ws_message_queues:
+        ws_message_queues[user_id] = queue.Queue(maxsize=100)
+    
     try:
         while True:
             # Check for queued messages to send
-            if (hasattr(send_notification, 'ws_messages') and 
-                user_id in send_notification.ws_messages and 
-                not send_notification.ws_messages[user_id].empty()):
+            if user_id in ws_message_queues and not ws_message_queues[user_id].empty():
                 try:
-                    message = send_notification.ws_messages[user_id].get_nowait()
+                    message = ws_message_queues[user_id].get_nowait()
                     await websocket.send_text(json.dumps(message))
-                    print(f"📡 WebSocket message sent to user {user_id}: {message}")
+                    print(f"📤 Sent WebSocket message to user {user_id}: {message.get('type', 'unknown')}")
                 except queue.Empty:
                     pass
                 except Exception as e:
-                    print(f"❌ Failed to send WebSocket message: {e}")
+                    print(f"❌ Error sending WebSocket message: {e}")
             
             # Small delay to prevent busy waiting
             await asyncio.sleep(0.1)
             
             # Try to receive (non-blocking) to detect disconnections
             try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                # Handle any incoming messages if needed
+                print(f"📥 Received message from user {user_id}: {data}")
             except asyncio.TimeoutError:
                 pass  # No message received, continue loop
                 
     except WebSocketDisconnect:
         if user_id in active_connections:
             del active_connections[user_id]
-        print(f"❌ User {user_id} disconnected")
+        print(f"❌ User {user_id} disconnected from WebSocket")
+
+@app.post("/api/accept_trade")
+def accept_trade(payload: dict):
+    """
+    Accept a trade proposal and execute the order
+    """
+    proposal_id = payload.get("proposal_id")
+    user_id = payload.get("user_id")
+    
+    if not proposal_id or not user_id:
+        raise HTTPException(status_code=400, detail="proposal_id and user_id are required")
+    
+    # Find the proposal in pending proposals
+    if proposal_id not in pending_proposals:
+        raise HTTPException(status_code=404, detail="Proposal not found or already processed")
+    
+    proposal = pending_proposals[proposal_id]
+    
+    try:
+        # Execute the trade using PortfolioManager
+        from broker.portfolio import PortfolioManager
+        portfolio_mgr = PortfolioManager()
+        
+        action_str = "BUY" if proposal["action"] == 1 else "SELL" if proposal["action"] == 2 else "HOLD"
+        
+        if action_str in ["BUY", "SELL"]:
+            # Execute the trade
+            result = portfolio_mgr.execute_trade(
+                user_id=user_id,
+                symbol=proposal["symbol"],
+                action=action_str,
+                quantity=proposal.get("quantity", 100),  # Default quantity
+                price=proposal["price"],
+                asset_type=proposal.get("asset_type", "stock")
+            )
+            
+            # Remove from pending proposals
+            del pending_proposals[proposal_id]
+            
+            # Send confirmation notification
+            send_notification(user_id, {
+                "type": "trade_executed",
+                "message": f"✅ {action_str} order executed for {proposal['symbol']}",
+                "proposal": proposal,
+                "result": result
+            })
+            
+            return {"status": "executed", "message": f"{action_str} order executed successfully", "result": result}
+        else:
+            # Remove from pending proposals anyway
+            del pending_proposals[proposal_id]
+            return {"status": "ignored", "message": "HOLD action - no trade executed"}
+            
+    except Exception as e:
+        print(f"❌ Trade execution error: {e}")
+        # Remove from pending proposals on error
+        if proposal_id in pending_proposals:
+            del pending_proposals[proposal_id]
+        raise HTTPException(status_code=500, detail=f"Trade execution failed: {str(e)}")
+
+@app.post("/api/reject_trade")
+def reject_trade(payload: dict):
+    """
+    Reject a trade proposal
+    """
+    proposal_id = payload.get("proposal_id")
+    user_id = payload.get("user_id")
+    
+    if not proposal_id or not user_id:
+        raise HTTPException(status_code=400, detail="proposal_id and user_id are required")
+    
+    # Find the proposal in pending proposals
+    if proposal_id not in pending_proposals:
+        raise HTTPException(status_code=404, detail="Proposal not found or already processed")
+    
+    proposal = pending_proposals[proposal_id]
+    action_str = "BUY" if proposal["action"] == 1 else "SELL" if proposal["action"] == 2 else "HOLD"
+    
+    # Remove from pending proposals
+    del pending_proposals[proposal_id]
+    
+    # Send rejection notification
+    send_notification(user_id, {
+        "type": "trade_rejected",
+        "message": f"❌ {action_str} proposal for {proposal['symbol']} rejected",
+        "proposal": proposal
+    })
+    
+    return {"status": "rejected", "message": "Trade proposal rejected successfully"}

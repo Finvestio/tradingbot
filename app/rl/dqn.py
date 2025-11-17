@@ -32,11 +32,15 @@ class DQNAgent:
         self.buf = deque(maxlen=buffer_size)
 
     def act(self, s, eps=0.1):
-        """ε-greedy action selection."""
+        """ε-greedy action selection with Q-value storage for confidence calculation."""
         if random.random() < eps:
+            # Store random Q-values for random actions
+            self.last_q_values = [0.0, 0.0, 0.0]  # Neutral confidence for random actions
             return random.randrange(self.action_dim)
         with torch.no_grad():
             qv = self.q(torch.tensor(s).float().unsqueeze(0))
+            # Store Q-values for confidence calculation
+            self.last_q_values = qv.squeeze().tolist()
             return int(qv.argmax().item())
 
     def push(self, s, a, r, ns, d):

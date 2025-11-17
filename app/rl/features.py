@@ -6,8 +6,8 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add basic indicators."""
     df = df.copy()
     df["ret"] = df["close"].pct_change().fillna(0)
-    df["sma10"] = df["close"].rolling(10).mean().fillna(method="bfill")
-    df["sma20"] = df["close"].rolling(20).mean().fillna(method="bfill")
+    df["sma10"] = df["close"].rolling(10).mean().bfill()
+    df["sma20"] = df["close"].rolling(20).mean().bfill()
     df["rsi"] = 100 - 100/(1 + df["ret"].clip(-0.2,0.2).rolling(14).mean().fillna(0))
     return df.ffill().bfill()
 

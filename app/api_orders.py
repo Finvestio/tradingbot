@@ -8,10 +8,12 @@ try:
     # Try relative imports first (when imported as a module)
     from .database import get_db
     from .models import User, OrderTrade, Portfolio
+    from .broker.portfolio import PortfolioManager
 except ImportError:
     # Fall back to direct imports (when running as standalone)
     from database import get_db
     from models import User, OrderTrade, Portfolio
+    from broker.portfolio import PortfolioManager
 
 # Create the router
 router = APIRouter(prefix="/api/orders")
@@ -49,7 +51,7 @@ class PortfolioSummary(BaseModel):
 @router.post("/place", response_model=OrderResponse)
 async def place_order(order: OrderRequest, db: Session = Depends(get_db)):
     """
-    Enhanced order placement with portfolio tracking and validation
+    Enhanced order placement using unified PortfolioManager.execute_trade method
     Supports multiple asset types: stock, crypto, derivative
     """
     try:
@@ -66,99 +68,27 @@ async def place_order(order: OrderRequest, db: Session = Depends(get_db)):
         if order.price <= 0:
             raise HTTPException(status_code=400, detail="Price must be positive")
         
-        # Find the user
-        user = db.query(User).filter(User.id == order.user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        # Use unified portfolio manager for trade execution
+        portfolio_manager = PortfolioManager(db)
         
-        # Calculate order total
-        order_total = order.price * order.qty
-        
-        # Handle BUY orders
-        if order.action.upper() == "BUY":
-            # Check wallet balance
-            if user.wallet_balance < order_total:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Insufficient balance. Available: ${user.wallet_balance:.2f}, Required: ${order_total:.2f}"
-                )
-            
-            # Deduct from wallet
-            user.wallet_balance -= order_total
-            
-            # Update or create portfolio holding
-            portfolio = db.query(Portfolio).filter(
-                Portfolio.user_id == order.user_id,
-                Portfolio.symbol == order.symbol.upper(),
-                Portfolio.asset_type == order.asset_type.lower()
-            ).first()
-            
-            if portfolio:
-                # Calculate new weighted average price
-                total_value = (portfolio.quantity * portfolio.avg_price) + (order.qty * order.price)
-                new_quantity = portfolio.quantity + order.qty
-                portfolio.avg_price = total_value / new_quantity if new_quantity > 0 else 0
-                portfolio.quantity = new_quantity
-            else:
-                # Create new portfolio holding
-                portfolio = Portfolio(
-                    user_id=order.user_id,
-                    symbol=order.symbol.upper(),
-                    asset_type=order.asset_type.lower(),
-                    quantity=order.qty,
-                    avg_price=order.price
-                )
-                db.add(portfolio)
-        
-        else:  # SELL order
-            # Check if user has enough holdings to sell
-            portfolio = db.query(Portfolio).filter(
-                Portfolio.user_id == order.user_id,
-                Portfolio.symbol == order.symbol.upper(),
-                Portfolio.asset_type == order.asset_type.lower()
-            ).first()
-            
-            if not portfolio or portfolio.quantity < order.qty:
-                current_holdings = portfolio.quantity if portfolio else 0
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Insufficient holdings. You own {current_holdings} {order.symbol}, trying to sell {order.qty}"
-                )
-            
-            # Update portfolio (reduce quantity)
-            portfolio.quantity -= order.qty
-            
-            # Add sale proceeds to wallet
-            user.wallet_balance += order_total
-            
-            # If quantity becomes zero, we can optionally keep the record with 0 quantity
-            # or remove it entirely - keeping it for now to preserve avg_price history
-        
-        # Create the trade record with asset type
-        trade = OrderTrade(
+        # Execute trade using the same method as bot trades
+        result = portfolio_manager.execute_trade(
             user_id=order.user_id,
-            symbol=order.symbol.upper(),
-            asset_type=order.asset_type.lower(),
-            date=date.today(),
-            action=order.action.upper(),
+            symbol=order.symbol,
+            action=order.action,
+            quantity=order.qty,
             price=order.price,
-            qty=order.qty
+            asset_type=order.asset_type
         )
-        
-        # Add trade and update user
-        db.add(trade)
-        db.commit()
-        db.refresh(user)
         
         return OrderResponse(
-            message=f"{order.action.upper()} order placed for {order.symbol.upper()}",
-            new_balance=user.wallet_balance
+            message=result["message"],
+            new_balance=result["new_wallet_balance"]
         )
         
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        db.rollback()
-        raise
+    except ValueError as e:
+        # Handle business logic errors (insufficient balance, etc.)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         # Handle any other exceptions
         db.rollback()
@@ -348,8 +278,20 @@ async def get_user_portfolio(user_id: int, db: Session = Depends(get_db)):
     
     for portfolio in portfolios:
         if portfolio.quantity > 0:  # Only include holdings with positive quantity
-            # For now, use avg_price as current_price - in production you'd fetch real market data
-            current_price = portfolio.avg_price  # TODO: Integrate with real market data API
+            # Fetch REAL-TIME price from Twelve Data API
+            current_price = portfolio.avg_price  # Default fallback
+            price_fetched = False
+            
+            try:
+                from app.data.loader import fetch_realtime_price
+                realtime_data = fetch_realtime_price(portfolio.symbol, portfolio.asset_type)
+                current_price = float(realtime_data["price"])
+                price_fetched = True
+            except Exception as e:
+                # Fallback to avg_price if real-time fetch fails
+                current_price = portfolio.avg_price
+                price_fetched = False
+            
             market_value = portfolio.quantity * current_price
             unrealized_pnl = (current_price - portfolio.avg_price) * portfolio.quantity
             
@@ -373,3 +315,76 @@ async def get_user_portfolio(user_id: int, db: Session = Depends(get_db)):
         total_unrealized_pnl=total_unrealized_pnl,
         holdings=holdings
     )
+
+@router.get("/user/{user_id}/portfolio/enhanced")
+async def get_enhanced_portfolio(user_id: int, db: Session = Depends(get_db)):
+    """
+    Get enhanced portfolio summary with advanced metrics using PortfolioManager
+    """
+    try:
+        portfolio_manager = PortfolioManager(db)
+        summary = await portfolio_manager.get_portfolio_summary(user_id)
+        
+        # Convert to dict for JSON response
+        return {
+            "user_id": summary.user_id,
+            "wallet_balance": summary.wallet_balance,
+            "total_market_value": summary.total_market_value,
+            "total_portfolio_value": summary.total_portfolio_value,
+            "total_unrealized_pnl": summary.total_unrealized_pnl,
+            "total_unrealized_pnl_percent": summary.total_unrealized_pnl_percent,
+            "positions_count": summary.positions_count,
+            "diversification_score": summary.diversification_score,
+            "positions": [
+                {
+                    "symbol": pos.symbol,
+                    "asset_type": pos.asset_type,
+                    "quantity": pos.quantity,
+                    "avg_price": pos.avg_price,
+                    "current_price": pos.current_price,
+                    "market_value": pos.market_value,
+                    "unrealized_pnl": pos.unrealized_pnl,
+                    "unrealized_pnl_percent": pos.unrealized_pnl_percent,
+                    "weight": pos.weight
+                }
+                for pos in summary.positions
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get portfolio summary: {str(e)}")
+
+@router.get("/user/{user_id}/portfolio/risk")
+async def get_portfolio_risk_metrics(user_id: int, db: Session = Depends(get_db)):
+    """
+    Get comprehensive risk metrics for user's portfolio
+    """
+    try:
+        portfolio_manager = PortfolioManager(db)
+        risk_metrics = await portfolio_manager.get_risk_metrics(user_id)
+        return risk_metrics
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get risk metrics: {str(e)}")
+
+@router.get("/user/{user_id}/portfolio/performance")
+async def get_portfolio_performance(user_id: int, days: int = 30, db: Session = Depends(get_db)):
+    """
+    Get portfolio performance metrics over specified time period
+    """
+    try:
+        portfolio_manager = PortfolioManager(db)
+        performance = portfolio_manager.get_portfolio_performance(user_id, days)
+        return performance
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get performance metrics: {str(e)}")
+
+@router.get("/user/{user_id}/position/{symbol}/{asset_type}/risk")
+async def get_position_risk(user_id: int, symbol: str, asset_type: str, db: Session = Depends(get_db)):
+    """
+    Get risk metrics for a specific position
+    """
+    try:
+        portfolio_manager = PortfolioManager(db)
+        risk_metrics = portfolio_manager.get_position_risk_metrics(user_id, symbol, asset_type)
+        return risk_metrics
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get position risk: {str(e)}")

@@ -17,23 +17,62 @@ class TradingEnv:
         self.reset()
 
     def _load_data(self):
-        cnx = mysql.connector.connect(**DB_CFG)
-        cur = cnx.cursor(dictionary=True)
-        cur.execute(
-            """SELECT ts, open, high, low, close, volume
-               FROM market_bars
-               WHERE symbol=%s AND asset_type=%s
-               ORDER BY ts ASC""",
-            (self.symbol, self.asset_type),
-        )
-        rows = cur.fetchall()
-        cur.close()
-        cnx.close()
-        df = pd.DataFrame(rows)
-        if df.empty:
-            raise RuntimeError(f"No bars found for {self.symbol} ({self.asset_type})")
-        df.rename(columns=str.lower, inplace=True)
-        self.df = make_features(df)
+        """Load market data from database or API as fallback."""
+        try:
+            # Try to load from database first
+            cnx = mysql.connector.connect(**DB_CFG)
+            cur = cnx.cursor(dictionary=True)
+            cur.execute(
+                """SELECT ts, open, high, low, close, volume
+                   FROM market_bars
+                   WHERE symbol=%s AND asset_type=%s
+                   ORDER BY ts ASC""",
+                (self.symbol, self.asset_type),
+            )
+            rows = cur.fetchall()
+            cur.close()
+            cnx.close()
+            
+            if not rows:
+                print(f"⚠️ No bars in database for {self.symbol}, fetching from API...")
+                # Fallback to fresh API data (same as chart_data endpoint)
+                from app.data.loader import fetch_from_api
+                df = fetch_from_api(self.symbol, self.asset_type, interval="1day", outputsize=100)
+                
+                if df is None or df.empty:
+                    raise RuntimeError(f"No data available for {self.symbol} ({self.asset_type})")
+                
+                print(f"✅ Fetched {len(df)} rows from API with columns: {list(df.columns)}")
+                
+                # Reset index to get Date as a column (it's currently the index)
+                df = df.reset_index()
+                
+                # Rename columns to lowercase
+                df.columns = df.columns.str.lower()
+                
+                # Map date to ts
+                if 'date' in df.columns:
+                    df = df.rename(columns={'date': 'ts'})
+                
+                # Ensure we have all required columns
+                required_cols = ['ts', 'open', 'high', 'low', 'close', 'volume']
+                if not all(col in df.columns for col in required_cols):
+                    print(f"⚠️ Available columns: {list(df.columns)}")
+                    raise RuntimeError(f"Missing required columns. Have: {list(df.columns)}, Need: {required_cols}")
+                
+                df = df[required_cols]
+            else:
+                df = pd.DataFrame(rows)
+            
+            df.rename(columns=str.lower, inplace=True)
+            self.df = make_features(df)
+            print(f"✅ Loaded {len(self.df)} bars for {self.symbol}")
+            
+        except Exception as e:
+            print(f"❌ Error loading market data: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"Failed to load data for {self.symbol} ({self.asset_type}): {e}")
 
     def reset(self):
         self.t = self.window - 1
@@ -49,20 +88,68 @@ class TradingEnv:
     def step(self, action: int):
         price = float(self.df.iloc[self.t]["close"])
         prev_equity = self.equity
-
-        if action == 1 and self.cash >= price:
-            self.position += 1
-            self.cash -= price
-        elif action == 2 and self.position > 0:
-            self.position -= 1
-            self.cash += price
-
+        
+        # Execute action and calculate reward
+        reward = 0.0
+        trade_executed = False
+        
+        if action == 1:  # BUY
+            if self.cash >= price:
+                self.position += 1
+                self.cash -= price
+                trade_executed = True
+                # Small negative reward for the cost of trading
+                reward -= 0.001  # Trading cost penalty
+            else:
+                # Penalty for trying to buy with insufficient funds
+                reward = -0.01
+                
+        elif action == 2:  # SELL
+            if self.position > 0:
+                self.position -= 1
+                self.cash += price
+                trade_executed = True
+                # Small negative reward for the cost of trading
+                reward -= 0.001  # Trading cost penalty
+            else:
+                # Penalty for trying to sell without position
+                reward = -0.01
+        
+        # Action 0 (HOLD) has no immediate cost
+        
         self.t += 1
         done = self.t >= len(self.df) - 1
-
-        current_price = float(self.df.iloc[self.t]["close"])
-        self.equity = self.cash + self.position * current_price
-        reward = (self.equity - prev_equity) / max(prev_equity, 1e-9)
+        
+        current_price = float(self.df.iloc[self.t]["close"]) if not done else price
+        new_equity = self.cash + self.position * current_price
+        
+        # Calculate equity change reward
+        equity_change = new_equity - prev_equity
+        
+        if trade_executed:
+            # For executed trades, reward is based on immediate impact + future price direction
+            if action == 1:  # BUY
+                # Reward buying if price goes up after purchase
+                price_change = (current_price - price) / price if price > 0 else 0
+                reward += price_change * 10  # Amplify price direction reward
+            elif action == 2:  # SELL
+                # Reward selling if price goes down after sale  
+                price_change = (price - current_price) / price if price > 0 else 0
+                reward += price_change * 10  # Amplify price direction reward
+        else:
+            # For HOLD, reward is proportional to portfolio performance
+            reward += (new_equity - prev_equity) / max(prev_equity, 1e-9)
+        
+        self.equity = new_equity
+        
+        # Add small penalty for excessive trading to encourage quality trades
+        if trade_executed and hasattr(self, 'recent_trades'):
+            self.recent_trades = getattr(self, 'recent_trades', 0) + 1
+            if self.recent_trades > 5:  # More than 5 trades recently
+                reward -= 0.005  # Overtrading penalty
+        else:
+            self.recent_trades = max(0, getattr(self, 'recent_trades', 0) - 0.1)
+        
         return self._get_state(), reward, done, {"equity": self.equity, "price": current_price}
 
     def info(self):

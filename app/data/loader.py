@@ -9,65 +9,150 @@ from dotenv import load_dotenv
 load_dotenv()
 API_KEY = os.getenv("TWELVEDATA_API_KEY", "f5206f280321485f9fe877095108faac")
 
+def fetch_realtime_price(symbol: str, asset_type: str = "stock") -> dict:
+    """
+    Fetches real-time price quote from Twelve Data API.
+    Returns current price, volume, and other quote data.
+    """
+    
+    # Modify symbol for crypto
+    query_symbol = symbol
+    if asset_type == "crypto" and "/" not in symbol:
+        query_symbol = f"{symbol}/USD"
+    
+    # Use price endpoint for real-time data
+    url = f"https://api.twelvedata.com/price?symbol={query_symbol}&apikey={API_KEY}"
+    
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        
+        # Check for API errors
+        if "code" in data and data.get("code") != 200:
+            error_msg = data.get("message", "Unknown API error")
+            raise RuntimeError(f"API Error: {error_msg}")
+        
+        # Validate response structure
+        if "price" not in data:
+            error_msg = data.get("message", "Unexpected response format")
+            raise RuntimeError(f"Invalid response: {error_msg}")
+        
+        return {
+            "symbol": symbol,
+            "price": float(data.get("price", 0)),
+            "timestamp": data.get("timestamp", datetime.now().isoformat()),
+            "volume": int(data.get("volume", 0)) if data.get("volume") else 0
+        }
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Network error: {str(e)}")
+    except (ValueError, KeyError) as e:
+        raise RuntimeError(f"Data parsing error: {str(e)}")
+
 def fetch_from_api(symbol: str, asset_type: str = "stock", interval: str = "1day", outputsize: int = 5000) -> pd.DataFrame:
     """
-    Fetches daily prices from Twelve Data free endpoint.
+    Fetches historical prices from Twelve Data free endpoint.
     Ensures proper datetime index for consistency.
     Supports different asset types.
     """
-    print(f"📡 Fetching {symbol} ({asset_type}) data from Twelve Data ...")
     
-    # Modify URL based on asset type
+    # Modify symbol for crypto
+    query_symbol = symbol
     if asset_type == "crypto":
-        # For crypto, ensure we have the proper format
         if "/" not in symbol:
-            symbol = f"{symbol}/USD"
-        url = (
-            f"https://api.twelvedata.com/time_series"
-            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={API_KEY}"
-        )
-    elif asset_type == "derivative":
-        # For derivatives, use same logic or add specific handling
-        url = (
-            f"https://api.twelvedata.com/time_series"
-            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={API_KEY}"
-        )
-    else:  # stock
-        url = (
-            f"https://api.twelvedata.com/time_series"
-            f"?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={API_KEY}"
-        )
+            query_symbol = f"{symbol}/USD"
     
-    r = requests.get(url)
-    data = r.json()
-
-    # Validate
-    if "values" not in data:
-        raise RuntimeError(data.get("message") or "Unexpected response")
-
-    df = pd.DataFrame(data["values"])
-    # Ensure datetime conversion is robust
-    df["datetime"] = pd.to_datetime(df["datetime"], errors='coerce')
-    df.rename(columns={"datetime": "Date", "close": "Close"}, inplace=True)
-    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    # Build URL
+    url = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={query_symbol}&interval={interval}&outputsize={outputsize}&apikey={API_KEY}"
+    )
     
-    # Remove any rows with invalid dates or prices
-    df = df.dropna(subset=["Date", "Close"])
-    
-    # Sort by date and set as index
-    df.sort_values("Date", inplace=True)
-    df.set_index("Date", inplace=True)
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        
+        # Check for API errors
+        if "code" in data and data.get("code") != 200:
+            error_msg = data.get("message", "Unknown API error")
+            print(f"❌ Twelve Data API error: {error_msg}")
+            raise RuntimeError(f"API Error: {error_msg}")
+        
+        # Validate response has values
+        if "values" not in data:
+            error_msg = data.get("message", "Unexpected response format")
+            print(f"❌ Invalid response: {error_msg}")
+            print(f"   Response keys: {list(data.keys())}")
+            raise RuntimeError(f"Invalid response: {error_msg}")
 
-    print(f"✅ Loaded {len(df)} rows from Twelve Data.")
-    return df[["Close"]]
+        df = pd.DataFrame(data["values"])
+        
+        # Check if DataFrame is empty
+        if df.empty:
+            raise RuntimeError(f"No data returned for {symbol}")
+        
+        # Ensure datetime conversion is robust
+        df["datetime"] = pd.to_datetime(df["datetime"], errors='coerce')
+        
+        # Rename columns to standard format
+        column_mapping = {
+            "datetime": "Date",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume"
+        }
+        
+        # Rename only columns that exist
+        for old_col, new_col in column_mapping.items():
+            if old_col in df.columns:
+                df.rename(columns={old_col: new_col}, inplace=True)
+        
+        # Convert numeric columns
+        numeric_cols = ["Open", "High", "Low", "Close", "Volume"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        
+        # Remove any rows with invalid dates or close prices
+        df = df.dropna(subset=["Date", "Close"])
+        
+        if df.empty:
+            raise RuntimeError(f"No valid data after processing for {symbol}")
+        
+        # Sort by date and set as index
+        df.sort_values("Date", inplace=True)
+        df.set_index("Date", inplace=True)
+
+        # Return all available columns (at minimum Close, but prefer all OHLCV)
+        available_cols = [col for col in ["Open", "High", "Low", "Close", "Volume"] if col in df.columns]
+        if not available_cols:
+            available_cols = ["Close"]  # Fallback to Close only
+        
+        print(f"✅ Loaded {len(df)} rows from Twelve Data with columns: {available_cols}")
+        return df[available_cols]
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Network error fetching data: {e}")
+        raise RuntimeError(f"Network error: {str(e)}")
+    except (ValueError, KeyError) as e:
+        print(f"❌ Data parsing error: {e}")
+        raise RuntimeError(f"Data parsing error: {str(e)}")
 
 
 def save_to_db(symbol: str, df: pd.DataFrame):
+    """
+    Save market data to database. Only saves Close price as that's what MarketData model stores.
+    """
     with SessionLocal() as db:
         for d, row in df.iterrows():
             date = pd.to_datetime(d).date()
             if not db.query(MarketData).filter_by(symbol=symbol, date=date).first():
-                db.add(MarketData(symbol=symbol, date=date, close=float(row["Close"])))
+                close_price = float(row.get("Close", 0))
+                if close_price > 0:  # Only save valid prices
+                    db.add(MarketData(symbol=symbol, date=date, close=close_price))
         db.commit()
 
 

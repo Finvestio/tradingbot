@@ -30,7 +30,9 @@ def train(symbol: str, asset_type: str, episodes: int = 10, steps_per_episode: i
             if done:
                 break
         rewards.append(total_r)
-        print(f"Episode {ep+1}/{episodes} | Reward={total_r:.4f} | Equity={info['equity']:.2f}")
+        # Reduce logging frequency
+        if ep % 5 == 0 or ep == episodes - 1:
+            print(f"Episode {ep+1}/{episodes} | Reward={total_r:.4f} | Equity={info['equity']:.2f}")
         time.sleep(0.1)
 
     model_path = f"models/dqn_{asset_type}_{symbol}.pth"
