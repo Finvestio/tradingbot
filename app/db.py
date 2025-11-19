@@ -125,6 +125,63 @@ def init_database():
                 )
             """)
             
+            # Create bot_trades table for RL bot trade history
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_trades (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    asset_type ENUM('stock', 'crypto', 'derivative') NOT NULL,
+                    action VARCHAR(10) NOT NULL,
+                    price DECIMAL(10,2) NOT NULL,
+                    quantity INT NOT NULL,
+                    reward DECIMAL(15,4) DEFAULT 0.0,
+                    equity DECIMAL(15,2) NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    INDEX idx_user_symbol (user_id, symbol),
+                    INDEX idx_timestamp (timestamp)
+                )
+            """)
+            
+            # Create rl_experiences table for replay buffer storage
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rl_experiences (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    asset_type VARCHAR(20) NOT NULL,
+                    symbol VARCHAR(20) NOT NULL,
+                    action INT NOT NULL,
+                    reward DECIMAL(15,4) NOT NULL,
+                    done TINYINT(1) NOT NULL,
+                    state_json TEXT NOT NULL,
+                    next_state_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    INDEX idx_user_symbol (user_id, symbol),
+                    INDEX idx_created_at (created_at)
+                )
+            """)
+            
+            # Create market_bars table for storing historical price data
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS market_bars (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    asset_type ENUM('stock', 'crypto', 'derivative') NOT NULL,
+                    ts DATETIME NOT NULL,
+                    open DECIMAL(10,2) NOT NULL,
+                    high DECIMAL(10,2) NOT NULL,
+                    low DECIMAL(10,2) NOT NULL,
+                    close DECIMAL(10,2) NOT NULL,
+                    volume BIGINT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY unique_bar (symbol, asset_type, ts),
+                    INDEX idx_symbol_type (symbol, asset_type),
+                    INDEX idx_ts (ts)
+                )
+            """)
+            
             connection.commit()
             print("✅ Database tables initialized successfully")
             return True

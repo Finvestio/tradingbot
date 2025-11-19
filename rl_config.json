@@ -1,19 +1,19 @@
 {
-  "strategy": "mean-reversion",
+  "strategy": "swing",
   "customStrategy": null,
-  "frequency": "low",
+  "frequency": "medium",
   "assetClass": "equities",
   "specificSymbols": [
-    "AAPPL"
+    "AAPL"
   ],
-  "useDefault357Rule": false,
-  "riskPerTrade": 5.0,
-  "maxPortfolioExposure": 3.0,
-  "riskRewardRatio": "1:1",
+  "useDefault357Rule": true,
+  "riskPerTrade": 3.0,
+  "maxPortfolioExposure": 5.0,
+  "riskRewardRatio": "1:2",
   "riskTolerance": "aggressive",
   "timeframes": [
-    "1h",
-    "1min"
+    "15min",
+    "1h"
   ],
   "rewardStrategy": "risk_adjusted",
   "customRewardWeights": {

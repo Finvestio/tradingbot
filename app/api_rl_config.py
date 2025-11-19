@@ -155,7 +155,10 @@ async def update_rl_configuration(config: RLConfiguration):
             # Apply configuration to existing RL system
             await apply_configuration_to_rl_system(config)
             
-            return {"message": "Configuration updated successfully", "config": config.dict()}
+            # Restart all running bots with new configuration
+            await restart_all_running_bots()
+            
+            return {"message": "Configuration updated successfully and bots restarted", "config": config.dict()}
         else:
             raise HTTPException(status_code=500, detail="Failed to save configuration")
             
@@ -301,3 +304,104 @@ async def get_current_rl_metrics():
         "learning_rate": 0.0003,
         "last_training_loss": 0.05
     }
+
+async def restart_all_running_bots():
+    """Restart all running bots with new configuration"""
+    try:
+        from app.api import running_bots
+        
+        print(f"\n{'='*80}")
+        print(f"🔄 RESTARTING ALL BOTS WITH NEW CONFIGURATION")
+        print(f"{'='*80}")
+        
+        # Get list of all running bots
+        bots_to_restart = []
+        for key, bot in list(running_bots.items()):
+            parts = key.split('_')
+            if len(parts) >= 3:
+                user_id = int(parts[0])
+                symbol = parts[1]
+                asset_type = '_'.join(parts[2:]) if len(parts) > 3 else parts[2]
+                bots_to_restart.append({
+                    'key': key,
+                    'user_id': user_id,
+                    'symbol': symbol,
+                    'asset_type': asset_type,
+                    'auto_execute': getattr(bot, 'auto_execute', True),
+                    'interval_sec': getattr(bot, 'interval_sec', 30)
+                })
+        
+        print(f"📋 Found {len(bots_to_restart)} running bot(s) to restart")
+        
+        if not bots_to_restart:
+            print("ℹ️ No running bots to restart")
+            return {"restarted": 0, "total": 0, "message": "No running bots to restart"}
+        
+        # Stop all bots first
+        for bot_info in bots_to_restart:
+            try:
+                print(f"🛑 Stopping bot: {bot_info['symbol']} for user {bot_info['user_id']}")
+                bot = running_bots.get(bot_info['key'])
+                if bot:
+                    # Set running flag to False to stop the bot
+                    bot.running = False
+                    # Remove from running_bots
+                    del running_bots[bot_info['key']]
+                    print(f"✅ Bot stopped: {bot_info['symbol']}")
+            except Exception as e:
+                print(f"⚠️ Error stopping bot {bot_info['key']}: {e}")
+        
+        # Wait a moment for bots to stop
+        import asyncio
+        await asyncio.sleep(1)
+        
+        # Restart all bots with new configuration
+        restarted_count = 0
+        for bot_info in bots_to_restart:
+            try:
+                print(f"🚀 Restarting bot: {bot_info['symbol']} for user {bot_info['user_id']}")
+                from app.bot.rl_trader import RLTrader
+                import threading
+                
+                new_bot = RLTrader(
+                    bot_info['user_id'],
+                    bot_info['symbol'],
+                    bot_info['asset_type'],
+                    bot_info['interval_sec'],
+                    bot_info['auto_execute']
+                )
+                
+                def run_bot():
+                    try:
+                        new_bot.run()
+                    except Exception as e:
+                        print(f"❌ Bot error: {e}")
+                
+                thread = threading.Thread(target=run_bot, daemon=True)
+                thread.start()
+                running_bots[bot_info['key']] = new_bot
+                restarted_count += 1
+                
+            except Exception as e:
+                print(f"⚠️ Error restarting bot {bot_info['key']}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"✅ Restarted {restarted_count}/{len(bots_to_restart)} bot(s) successfully")
+        print(f"{'='*80}\n")
+        
+        return {
+            "restarted": restarted_count,
+            "total": len(bots_to_restart),
+            "message": f"Restarted {restarted_count} bot(s) with new configuration"
+        }
+        
+    except Exception as e:
+        print(f"❌ Error restarting bots: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "restarted": 0,
+            "total": 0,
+            "error": str(e)
+        }

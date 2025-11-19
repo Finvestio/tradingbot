@@ -87,7 +87,7 @@ class User(Base):
 
 # Portfolio Model for Multi-Asset Holdings
 class Portfolio(Base):
-    __tablename__ = "portfolios"
+    __tablename__ = "portfolio"  # Match MySQL table name (singular)
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"))

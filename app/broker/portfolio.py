@@ -69,9 +69,10 @@ class PortfolioManager:
         
         for position in positions:
             if position.quantity > 0:  # Only include positions with holdings
-                # Get real-time price
+                # Get real-time price (synchronous call, not async)
                 try:
-                    current_price = await fetch_realtime_price(position.symbol, position.asset_type)
+                    realtime_data = fetch_realtime_price(position.symbol, position.asset_type)
+                    current_price = float(realtime_data["price"])
                 except Exception:
                     # Fallback to average price if real-time fetch fails
                     current_price = position.avg_price
@@ -296,6 +297,75 @@ class PortfolioManager:
             "net_investment": total_invested - total_divested,
             "trading_frequency": total_trades / max(days, 1)
         }
+    
+    def get_portfolio_summary_sync(self, user_id: int) -> PortfolioSummary:
+        """
+        Synchronous version of get_portfolio_summary for use in non-async contexts
+        """
+        # Get user and wallet balance
+        user = self.db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise ValueError(f"User {user_id} not found")
+        
+        # Get all portfolio positions
+        positions = self.db.query(Portfolio).filter(Portfolio.user_id == user_id).all()
+        
+        portfolio_positions = []
+        total_market_value = 0.0
+        
+        for position in positions:
+            if position.quantity > 0:  # Only include positions with holdings
+                # Get real-time price (synchronous)
+                try:
+                    realtime_data = fetch_realtime_price(position.symbol, position.asset_type)
+                    current_price = float(realtime_data["price"])
+                except Exception:
+                    # Fallback to average price if real-time fetch fails
+                    current_price = position.avg_price
+                
+                # Calculate position metrics
+                market_value = position.quantity * current_price
+                unrealized_pnl = (current_price - position.avg_price) * position.quantity
+                unrealized_pnl_percent = ((current_price - position.avg_price) / position.avg_price) * 100 if position.avg_price > 0 else 0
+                
+                portfolio_positions.append(PortfolioPosition(
+                    symbol=position.symbol,
+                    asset_type=position.asset_type,
+                    quantity=position.quantity,
+                    avg_price=position.avg_price,
+                    current_price=current_price,
+                    market_value=market_value,
+                    unrealized_pnl=unrealized_pnl,
+                    unrealized_pnl_percent=unrealized_pnl_percent,
+                    weight=0  # Will be calculated after total is known
+                ))
+                
+                total_market_value += market_value
+        
+        # Calculate position weights
+        for position in portfolio_positions:
+            position.weight = (position.market_value / total_market_value * 100) if total_market_value > 0 else 0
+        
+        # Calculate portfolio totals
+        total_portfolio_value = user.wallet_balance + total_market_value
+        total_unrealized_pnl = sum(pos.unrealized_pnl for pos in portfolio_positions)
+        total_cost_basis = sum(pos.avg_price * pos.quantity for pos in portfolio_positions)
+        total_unrealized_pnl_percent = (total_unrealized_pnl / total_cost_basis * 100) if total_cost_basis > 0 else 0
+        
+        # Calculate diversification score (higher is more diversified)
+        diversification_score = self._calculate_diversification_score(portfolio_positions)
+        
+        return PortfolioSummary(
+            user_id=user_id,
+            wallet_balance=user.wallet_balance,
+            total_market_value=total_market_value,
+            total_portfolio_value=total_portfolio_value,
+            total_unrealized_pnl=total_unrealized_pnl,
+            total_unrealized_pnl_percent=total_unrealized_pnl_percent,
+            positions=portfolio_positions,
+            positions_count=len(portfolio_positions),
+            diversification_score=diversification_score
+        )
     
     def _calculate_diversification_score(self, positions: List[PortfolioPosition]) -> float:
         """

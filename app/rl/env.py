@@ -18,6 +18,8 @@ class TradingEnv:
 
     def _load_data(self):
         """Load market data from database or API as fallback."""
+        cnx = None
+        cur = None
         try:
             # Try to load from database first
             cnx = mysql.connector.connect(**DB_CFG)
@@ -30,19 +32,29 @@ class TradingEnv:
                 (self.symbol, self.asset_type),
             )
             rows = cur.fetchall()
-            cur.close()
-            cnx.close()
+            if cur:
+                cur.close()
+            if cnx:
+                cnx.close()
             
             if not rows:
                 print(f"⚠️ No bars in database for {self.symbol}, fetching from API...")
                 # Fallback to fresh API data (same as chart_data endpoint)
-                from app.data.loader import fetch_from_api
-                df = fetch_from_api(self.symbol, self.asset_type, interval="1day", outputsize=100)
+                from app.data.loader import fetch_from_api, load_market_data
+                
+                # Try API first
+                try:
+                    df = fetch_from_api(self.symbol, self.asset_type, interval="1day", outputsize=100)
+                except Exception as api_error:
+                    print(f"⚠️ API fetch failed: {api_error}")
+                    print(f"📦 Trying cached data as fallback...")
+                    # Fallback to cached data
+                    df = load_market_data(self.symbol, self.asset_type)
                 
                 if df is None or df.empty:
                     raise RuntimeError(f"No data available for {self.symbol} ({self.asset_type})")
                 
-                print(f"✅ Fetched {len(df)} rows from API with columns: {list(df.columns)}")
+                print(f"✅ Fetched {len(df)} rows with columns: {list(df.columns)}")
                 
                 # Reset index to get Date as a column (it's currently the index)
                 df = df.reset_index()
@@ -72,6 +84,11 @@ class TradingEnv:
             print(f"❌ Error loading market data: {e}")
             import traceback
             traceback.print_exc()
+            # Ensure cleanup on error
+            if cur:
+                cur.close()
+            if cnx:
+                cnx.close()
             raise RuntimeError(f"Failed to load data for {self.symbol} ({self.asset_type}): {e}")
 
     def reset(self):
@@ -150,7 +167,11 @@ class TradingEnv:
         else:
             self.recent_trades = max(0, getattr(self, 'recent_trades', 0) - 0.1)
         
-        return self._get_state(), reward, done, {"equity": self.equity, "price": current_price}
+        return self._get_state(), reward, done, {
+            "equity": self.equity, 
+            "price": current_price,
+            "trade_executed": trade_executed
+        }
 
     def info(self):
         return dict(symbol=self.symbol, steps=len(self.df), window=self.window)

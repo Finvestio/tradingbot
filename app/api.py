@@ -58,6 +58,13 @@ except ImportError:
     print("⚠️ RL Config router not available - continuing without it")
     rl_config_router = None
 
+# Try to import RL explanation router
+try:
+    from app.api_rl_explanation import router as rl_explanation_router
+except ImportError:
+    print("⚠️ RL Explanation router not available - continuing without it")
+    rl_explanation_router = None
+
 app = FastAPI(title="Trading Bot API")
 
 # Register the orders router if available
@@ -73,6 +80,13 @@ if rl_config_router:
     print("✅ RL Configuration router registered")
 else:
     print("⚠️ RL Configuration router not available - skipping registration")
+
+# Register the RL explanation router if available
+if rl_explanation_router:
+    app.include_router(rl_explanation_router)
+    print("✅ RL Explanation router registered")
+else:
+    print("⚠️ RL Explanation router not available - skipping registration")
 
 # Global dictionary to track active trading bots
 active_bots = {}
@@ -660,8 +674,10 @@ def start_bot_old_sma(payload: dict):
                         if wallet >= cost:
                             if auto_execute:
                                 # Auto-execute the trade immediately
-                                from broker.portfolio import PortfolioManager
-                                portfolio_mgr = PortfolioManager()
+                                from app.broker.portfolio import PortfolioManager
+                                from app.database import get_db
+                                db = next(get_db())
+                                portfolio_mgr = PortfolioManager(db)
                                 
                                 try:
                                     result = portfolio_mgr.execute_trade(
@@ -736,8 +752,10 @@ def start_bot_old_sma(payload: dict):
                             
                             if auto_execute:
                                 # Auto-execute the trade immediately
-                                from broker.portfolio import PortfolioManager
-                                portfolio_mgr = PortfolioManager()
+                                from app.broker.portfolio import PortfolioManager
+                                from app.database import get_db
+                                db = next(get_db())
+                                portfolio_mgr = PortfolioManager(db)
                                 
                                 try:
                                     result = portfolio_mgr.execute_trade(
@@ -1040,8 +1058,47 @@ def get_portfolio_summary(user_id: int):
         
         print(f"📊 Portfolio updated: {len(updated_holdings)} holdings, total value: ${total_holdings_value:.2f}")
         
-        # Get recent orders
+        # Get recent orders (manual orders)
         recent_orders = get_user_orders(user_id, 10)
+        
+        # Get recent bot trades from bot_trades table
+        try:
+            from app.db import get_db_cursor
+            with get_db_cursor() as (cur, cnx):
+                if cur:
+                    cur.execute("""
+                        SELECT id, symbol, asset_type, action, price, quantity, reward, equity, timestamp
+                        FROM bot_trades
+                        WHERE user_id = %s
+                        ORDER BY timestamp DESC
+                        LIMIT 10
+                    """, (user_id,))
+                    bot_trades = cur.fetchall()
+                    
+                    # Format bot trades to match recent_orders format
+                    formatted_bot_trades = []
+                    for trade in bot_trades:
+                        formatted_bot_trades.append({
+                            "id": trade["id"],
+                            "symbol": trade["symbol"],
+                            "asset_type": trade["asset_type"],
+                            "side": trade["action"],  # BUY, SELL, or HOLD
+                            "price": float(trade["price"]),
+                            "quantity": float(trade["quantity"]),
+                            "reward": float(trade.get("reward", 0)),
+                            "equity": float(trade.get("equity", 0)),
+                            "timestamp": trade["timestamp"].isoformat() if trade["timestamp"] else None,
+                            "source": "bot"  # Mark as bot trade
+                        })
+                    
+                    # Combine manual orders and bot trades, sort by timestamp
+                    all_recent = recent_orders + formatted_bot_trades
+                    # Sort by timestamp descending (most recent first)
+                    all_recent.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+                    recent_orders = all_recent[:10]  # Limit to 10 most recent
+        except Exception as e:
+            print(f"⚠️ Error loading bot trades: {e}")
+            # Continue with just manual orders if bot trades fail
         
         return {
             "user_id": user_id,
@@ -1058,14 +1115,62 @@ def get_portfolio_summary(user_id: int):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching portfolio summary: {str(e)}")
 
+@app.get("/api/bot_trades/{user_id}")
+def get_bot_trades(user_id: int, limit: int = 50):
+    """
+    Get bot trading history with rewards for a specific user.
+    Returns trades sorted by most recent first.
+    """
+    try:
+        with get_db_cursor() as (cur, cnx):
+            if cur is None:
+                return {"user_id": user_id, "total_trades": 0, "trades": []}
+            
+            cur.execute("""
+                SELECT id, symbol, asset_type, action, price, quantity, reward, equity, timestamp
+                FROM bot_trades
+                WHERE user_id = %s
+                ORDER BY timestamp DESC
+                LIMIT %s
+            """, (user_id, limit))
+            
+            trades = cur.fetchall()
+        
+        # Format trades for frontend
+        formatted_trades = []
+        for trade in trades:
+            formatted_trades.append({
+                "id": trade["id"],
+                "symbol": trade["symbol"],
+                "asset_type": trade["asset_type"],
+                "action": trade["action"],
+                "price": float(trade["price"]),
+                "quantity": float(trade["quantity"]),
+                "reward": float(trade["reward"]),
+                "equity": float(trade["equity"]),
+                "timestamp": trade["timestamp"].isoformat() if trade["timestamp"] else None
+            })
+        
+        return {
+            "user_id": user_id,
+            "total_trades": len(formatted_trades),
+            "trades": formatted_trades
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching bot trades: {str(e)}")
+
 running_bots = {}
 
 @app.post("/api/start_bot")
 def start_bot(payload: dict):
     """
-    Start the RL trading bot for a user and asset.
+    Start the RL trading bot for a user and asset(s).
+    Supports both single-asset and multi-asset portfolio trading.
     
-    Example:
+    Single-asset example:
     {
         "user_id": 1,
         "symbol": "AAPL",
@@ -1073,29 +1178,67 @@ def start_bot(payload: dict):
         "interval_sec": 30,
         "auto_execute": true
     }
+    
+    Multi-asset portfolio example:
+    {
+        "user_id": 1,
+        "symbols": [["AAPL", "stock"], ["BTC/USD", "crypto"], ["TSLA", "stock"]],
+        "interval_sec": 30,
+        "auto_execute": true,
+        "use_per": true
+    }
     """
     user_id = payload.get("user_id")
     symbol = payload.get("symbol")
     asset_type = payload.get("asset_type", "stock")
+    symbols = payload.get("symbols")  # Multi-asset: list of [symbol, asset_type] pairs
     interval_sec = int(payload.get("interval_sec", 30))  # Default 30 seconds
     auto_execute = payload.get("auto_execute", True)  # Default to auto-execute
+    use_per = payload.get("use_per", True)  # Default to using Prioritized Experience Replay
 
-    if not user_id or not symbol:
-        raise HTTPException(status_code=400, detail="user_id and symbol are required")
-
-    key = f"{user_id}_{symbol}_{asset_type}"
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    
+    # Determine if multi-asset or single-asset
+    if symbols and isinstance(symbols, list) and len(symbols) > 1:
+        # Multi-asset portfolio mode
+        if not all(isinstance(s, (list, tuple)) and len(s) == 2 for s in symbols):
+            raise HTTPException(status_code=400, detail="symbols must be list of [symbol, asset_type] pairs")
+        
+        symbols_tuples = [(str(s[0]), str(s[1])) for s in symbols]
+        key = f"{user_id}_portfolio_{len(symbols_tuples)}assets"
+        
+        print(f"\n{'='*80}")
+        print(f"🚀 STARTING MULTI-ASSET PORTFOLIO RL BOT")
+        print(f"{'='*80}")
+        print(f"User ID: {user_id}")
+        print(f"Assets: {', '.join([f'{s[0]} ({s[1]})' for s in symbols_tuples])}")
+        print(f"Number of Assets: {len(symbols_tuples)}")
+        print(f"Interval: {interval_sec} seconds")
+        print(f"Auto Execute: {auto_execute}")
+        print(f"Prioritized Experience Replay: {use_per}")
+        print(f"{'='*80}\n")
+    else:
+        # Single-asset mode (backward compatible)
+        if not symbol:
+            raise HTTPException(status_code=400, detail="symbol is required (or provide symbols for multi-asset)")
+        
+        key = f"{user_id}_{symbol}_{asset_type}"
+        symbols_tuples = None
+        
+        print(f"\n{'='*80}")
+        print(f"🚀 STARTING RL BOT")
+        print(f"{'='*80}")
+        print(f"User ID: {user_id}")
+        print(f"Symbol: {symbol}")
+        print(f"Asset Type: {asset_type}")
+        print(f"Interval: {interval_sec} seconds")
+        print(f"Auto Execute: {auto_execute}")
+        print(f"Prioritized Experience Replay: {use_per}")
+        print(f"{'='*80}\n")
+    
     if key in running_bots:
-        raise HTTPException(status_code=400, detail="Bot already running for this user/asset")
-
-    print(f"\n{'='*80}")
-    print(f"🚀 STARTING RL BOT")
-    print(f"{'='*80}")
-    print(f"User ID: {user_id}")
-    print(f"Symbol: {symbol}")
-    print(f"Asset Type: {asset_type}")
-    print(f"Interval: {interval_sec} seconds")
-    print(f"Auto Execute: {auto_execute}")
-    print(f"{'='*80}\n")
+        raise HTTPException(status_code=400, detail="Bot already running for this user/asset(s)")
 
     def run_bot_with_error_handling():
         try:
@@ -1109,20 +1252,40 @@ def start_bot(payload: dict):
             traceback.print_exc()
             print(f"{'!'*80}\n")
 
-    bot = RLTrader(user_id, symbol, asset_type, interval_sec, auto_execute)
+    # Create bot with appropriate parameters
+    if symbols_tuples:
+        # Multi-asset portfolio mode
+        bot = RLTrader(user_id, symbol=None, asset_type=None, interval_sec=interval_sec, 
+                      auto_execute=auto_execute, symbols=symbols_tuples, use_per=use_per)
+    else:
+        # Single-asset mode
+        bot = RLTrader(user_id, symbol, asset_type, interval_sec, auto_execute, 
+                      symbols=None, use_per=use_per)
+    
     thread = threading.Thread(target=run_bot_with_error_handling, daemon=True)
     thread.start()
     running_bots[key] = bot
 
-    print(f"✅ Bot thread started successfully for {symbol}")
-
-    return {
-        "status": "started", 
-        "symbol": symbol, 
-        "asset_type": asset_type, 
-        "user_id": user_id,
-        "interval_sec": interval_sec,
-        "auto_execute": auto_execute
+    if symbols_tuples:
+        print(f"✅ Multi-asset portfolio bot thread started successfully for {len(symbols_tuples)} assets")
+        return {
+            "status": "started",
+            "mode": "multi_asset",
+            "num_assets": len(symbols_tuples),
+            "symbols": [{"symbol": s[0], "asset_type": s[1]} for s in symbols_tuples],
+            "use_per": use_per
+        }
+    else:
+        print(f"✅ Bot thread started successfully for {symbol}")
+        return {
+            "status": "started",
+            "mode": "single_asset",
+            "symbol": symbol, 
+            "asset_type": asset_type, 
+            "user_id": user_id,
+            "interval_sec": interval_sec,
+            "auto_execute": auto_execute,
+            "use_per": use_per
     }
 
 
@@ -1137,12 +1300,16 @@ def stop_bot(payload: dict):
     asset_type = payload.get("asset_type", "stock")
 
     key = f"{user_id}_{symbol}_{asset_type}"
-    bot = running_bots.pop(key, None)
+    bot = running_bots.get(key)
     if not bot:
         raise HTTPException(status_code=404, detail="No bot running for this user/asset")
 
-    print(f"🛑 Bot stopped for {symbol} ({asset_type}) — user {user_id}")
-    return {"status": "stopped", "symbol": symbol}
+    # Stop the bot by setting running flag to False
+    bot.running = False
+    running_bots.pop(key, None)
+    
+    print(f"🛑 Bot stopped for {symbol} ({asset_type}) — user {user_id}", flush=True)
+    return {"status": "stopped", "symbol": symbol, "message": "Bot stopped successfully"}
 
 @app.post("/api/trade_response")
 def trade_response(payload: dict):
@@ -1162,19 +1329,52 @@ def trade_response(payload: dict):
     if decision not in ["accept", "reject"]:
         raise HTTPException(status_code=400, detail="decision must be 'accept' or 'reject'")
     
-    # Find the proposal
-    key = (user_id, symbol)
+    # Get asset_type from payload or try to find proposal with/without asset_type
+    asset_type = payload.get("asset_type", "stock")
+    
+    # Try to find proposal with asset_type first (new format)
+    key = (user_id, symbol, asset_type)
     if key not in trade_proposals:
-        raise HTTPException(status_code=404, detail="No pending trade proposal found")
+        # Try old format for backward compatibility
+        key_old = (user_id, symbol)
+        if key_old in trade_proposals:
+            key = key_old
+            print(f"⚠️ Found proposal with old key format (without asset_type), using it")
+        else:
+            raise HTTPException(status_code=404, detail=f"No pending trade proposal found for {symbol} ({asset_type})")
     
     proposal = trade_proposals[key]
     
     if decision == "accept":
         # Execute the trade
         try:
-            # Get the RLTrader instance (we'll create a temporary one for execution)
-            trader = RLTrader(user_id, symbol, proposal["asset_type"])
-            success = trader.execute_approved_trade(proposal)
+            # Find the running bot instance for this user/symbol
+            key = f"{user_id}_{symbol}_{proposal.get('asset_type', 'stock')}"
+            bot = running_bots.get(key)
+            
+            if bot:
+                # Use the existing bot instance to execute the trade
+                success = bot.execute_approved_trade(proposal)
+            else:
+                # Fallback: execute directly using PortfolioManager
+                from app.broker.portfolio import PortfolioManager
+                from app.database import get_db
+                db = next(get_db())
+                portfolio_mgr = PortfolioManager(db)
+                
+                action_str = {1: "BUY", 2: "SELL", 0: "HOLD"}.get(proposal["action"], "HOLD")
+                if action_str in ["BUY", "SELL"]:
+                    result = portfolio_mgr.execute_trade(
+                        user_id=user_id,
+                        symbol=symbol,
+                        action=action_str,
+                        quantity=proposal.get("quantity", 1),
+                        price=proposal["price"],
+                        asset_type=proposal.get("asset_type", "stock")
+                    )
+                    success = result.get("success", False)
+                else:
+                    success = False
             
             if success:
                 # Remove proposal after successful execution
@@ -1186,6 +1386,8 @@ def trade_response(payload: dict):
                 
         except Exception as e:
             print(f"❌ Error executing approved trade: {e}")
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Failed to execute trade: {str(e)}")
     
     else:  # decision == "reject"
@@ -1265,7 +1467,7 @@ def test_proposal(payload: dict):
             loop.run_until_complete(ws.send_text(proposal_json))
             loop.close()
             
-            print("✅ Test proposal sent successfully to user {user_id}")
+            print(f"✅ Test proposal sent successfully to user {user_id}")
             return {"status": "sent", "proposal": proposal, "message": "Test proposal sent via WebSocket"}
             
         except Exception as e:
@@ -1278,7 +1480,25 @@ def test_proposal(payload: dict):
         return {"status": "error", "message": error_msg}
 
 @app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: int):
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    # Validate user_id before accepting connection
+    if user_id is None or user_id == "undefined" or user_id == "":
+        print(f"❌ Invalid user_id for WebSocket connection: {user_id}")
+        await websocket.close(code=4003, reason="Invalid user_id")
+        return
+    
+    # Convert to int
+    try:
+        user_id_int = int(user_id)
+        if user_id_int <= 0:
+            raise ValueError("User ID must be positive")
+    except (ValueError, TypeError) as e:
+        print(f"❌ Cannot convert user_id to int: {user_id} - {e}")
+        await websocket.close(code=4003, reason="Invalid user_id format")
+        return
+    
+    user_id = user_id_int  # Use the validated integer
+    
     await websocket.accept()
     active_connections[user_id] = websocket
     print(f"✅ WebSocket connected for user {user_id}")
@@ -1286,26 +1506,55 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     # Initialize message queue for this user if not exists
     if user_id not in ws_message_queues:
         ws_message_queues[user_id] = queue.Queue(maxsize=100)
+        print(f"📦 Created message queue for user {user_id}")
+    else:
+        pending_count = ws_message_queues[user_id].qsize()
+        print(f"📦 Using existing message queue for user {user_id} (has {pending_count} pending messages)")
+    
+    # Send any pending messages that were queued before connection
+    pending_sent = 0
+    while user_id in ws_message_queues and not ws_message_queues[user_id].empty():
+        try:
+            message = ws_message_queues[user_id].get_nowait()
+            await websocket.send_text(json.dumps(message))
+            pending_sent += 1
+            print(f"📤 Sent pending WebSocket message to user {user_id}: {message.get('type', 'unknown')}")
+        except queue.Empty:
+            break
+        except Exception as e:
+            print(f"❌ Error sending pending WebSocket message: {e}")
+            break
+    
+    if pending_sent > 0:
+        print(f"✅ Sent {pending_sent} pending messages to user {user_id} on connection")
     
     try:
         while True:
-            # Check for queued messages to send
-            if user_id in ws_message_queues and not ws_message_queues[user_id].empty():
+            # Actively check for queued messages to send (higher priority)
+            messages_sent = 0
+            while user_id in ws_message_queues and not ws_message_queues[user_id].empty():
                 try:
                     message = ws_message_queues[user_id].get_nowait()
                     await websocket.send_text(json.dumps(message))
-                    print(f"📤 Sent WebSocket message to user {user_id}: {message.get('type', 'unknown')}")
+                    messages_sent += 1
+                    print(f"📤 Sent queued WebSocket message to user {user_id}: {message.get('type', 'unknown')} - {message.get('symbol', 'N/A')}")
                 except queue.Empty:
-                    pass
+                    break
                 except Exception as e:
-                    print(f"❌ Error sending WebSocket message: {e}")
+                    print(f"❌ Error sending queued WebSocket message: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    break
+            
+            if messages_sent > 0:
+                print(f"✅ Sent {messages_sent} queued message(s) to user {user_id}")
             
             # Small delay to prevent busy waiting
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05)  # Reduced from 0.1 to check more frequently
             
             # Try to receive (non-blocking) to detect disconnections
             try:
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
                 # Handle any incoming messages if needed
                 print(f"📥 Received message from user {user_id}: {data}")
             except asyncio.TimeoutError:
@@ -1314,12 +1563,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     except WebSocketDisconnect:
         if user_id in active_connections:
             del active_connections[user_id]
-        print(f"❌ User {user_id} disconnected from WebSocket")
+        # Keep message queue for potential reconnection (messages will be sent when reconnected)
+        print(f"❌ User {user_id} disconnected from WebSocket (queue preserved for reconnection)")
+    except Exception as e:
+        print(f"❌ WebSocket error for user {user_id}: {e}")
+        if user_id in active_connections:
+            del active_connections[user_id]
 
 @app.post("/api/accept_trade")
 def accept_trade(payload: dict):
     """
-    Accept a trade proposal and execute the order
+    Accept a trade proposal and execute the order via RL bot
     """
     proposal_id = payload.get("proposal_id")
     user_id = payload.get("user_id")
@@ -1327,51 +1581,132 @@ def accept_trade(payload: dict):
     if not proposal_id or not user_id:
         raise HTTPException(status_code=400, detail="proposal_id and user_id are required")
     
-    # Find the proposal in pending proposals
-    if proposal_id not in pending_proposals:
-        raise HTTPException(status_code=404, detail="Proposal not found or already processed")
+    print(f"✅ Accept trade request: proposal_id={proposal_id}, user_id={user_id}")
     
-    proposal = pending_proposals[proposal_id]
+    # Try to find proposal in RL bot's trade_proposals (new system)
+    from app.bot.rl_trader import trade_proposals
+    import time
+    
+    # Get asset_type from payload if provided
+    asset_type_from_payload = payload.get("asset_type", None)
+    symbol_from_payload = payload.get("symbol", None)
+    
+    # Extract symbol from proposal_id (format: "user_id_symbol_timestamp")
+    proposal_found = None
+    proposal_key = None
+    
+    # Search in trade_proposals dictionary
+    for key, prop in trade_proposals.items():
+        # Check if proposal matches by ID or user_id
+        if prop.get("proposal_id") == proposal_id or (prop.get("user_id") == user_id and (not symbol_from_payload or prop.get("symbol") == symbol_from_payload)):
+            # If asset_type is provided, also match it
+            if asset_type_from_payload:
+                prop_asset_type = prop.get("asset_type", "stock")
+                if prop_asset_type != asset_type_from_payload:
+                    continue  # Skip if asset_type doesn't match
+            
+            # Check if this is the right proposal
+            if prop.get("proposal_id") == proposal_id:
+                proposal_found = prop
+                proposal_key = key
+                break
+    
+    if not proposal_found:
+        # Fallback to old pending_proposals system
+        if proposal_id in pending_proposals:
+            proposal_found = pending_proposals[proposal_id]
+            print(f"📋 Found proposal in old pending_proposals")
+        else:
+            print(f"❌ Proposal not found: {proposal_id}")
+            print(f"📋 Available proposals: {list(trade_proposals.keys())}")
+            raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found or already processed")
+    
+    proposal = proposal_found
+    symbol = proposal.get("symbol")
+    user_id_int = int(user_id) if isinstance(user_id, str) else user_id
+    
+    print(f"📋 Found proposal: {symbol} for user {user_id_int}")
     
     try:
-        # Execute the trade using PortfolioManager
-        from broker.portfolio import PortfolioManager
-        portfolio_mgr = PortfolioManager()
+        # Find the running RL bot for this user and symbol
+        # Bot key format is: "{user_id}_{symbol}_{asset_type}"
+        asset_type = proposal.get("asset_type", "stock")
+        bot_key = f"{user_id_int}_{symbol}_{asset_type}"
         
-        action_str = "BUY" if proposal["action"] == 1 else "SELL" if proposal["action"] == 2 else "HOLD"
+        bot = running_bots.get(bot_key)
         
-        if action_str in ["BUY", "SELL"]:
-            # Execute the trade
-            result = portfolio_mgr.execute_trade(
-                user_id=user_id,
-                symbol=proposal["symbol"],
-                action=action_str,
-                quantity=proposal.get("quantity", 100),  # Default quantity
-                price=proposal["price"],
-                asset_type=proposal.get("asset_type", "stock")
-            )
+        print(f"🔍 Looking for bot with key: {bot_key}")
+        print(f"🔍 Available bot keys: {list(running_bots.keys())}")
+        
+        if bot:
+            print(f"🤖 Found running bot for {symbol}, executing approved trade...")
+            print(f"📋 Proposal details: action={proposal.get('action')}, price=${proposal.get('price', 0):.2f}, symbol={symbol}")
             
-            # Remove from pending proposals
-            del pending_proposals[proposal_id]
+            # Use RL bot's execute_approved_trade method (handles database recording)
+            try:
+                success = bot.execute_approved_trade(proposal)
+                print(f"📊 Execute approved trade returned: {success}")
+            except Exception as e:
+                print(f"❌ Error in execute_approved_trade: {e}")
+                import traceback
+                traceback.print_exc()
+                success = False
             
-            # Send confirmation notification
-            send_notification(user_id, {
-                "type": "trade_executed",
-                "message": f"✅ {action_str} order executed for {proposal['symbol']}",
-                "proposal": proposal,
-                "result": result
-            })
-            
-            return {"status": "executed", "message": f"{action_str} order executed successfully", "result": result}
+            if success:
+                # Remove from trade_proposals
+                if proposal_key and proposal_key in trade_proposals:
+                    del trade_proposals[proposal_key]
+                elif proposal_id in pending_proposals:
+                    del pending_proposals[proposal_id]
+                
+                action_name = proposal.get("action_name", "BUY" if proposal["action"] == 1 else "SELL" if proposal["action"] == 2 else "HOLD")
+                print(f"✅ Trade executed successfully: {action_name} {symbol}")
+                return {
+                    "status": "executed", 
+                    "message": f"{action_name} order executed successfully",
+                    "symbol": symbol,
+                    "action": proposal["action"]
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Trade execution failed in bot")
         else:
-            # Remove from pending proposals anyway
-            del pending_proposals[proposal_id]
-            return {"status": "ignored", "message": "HOLD action - no trade executed"}
+            # Fallback: Use PortfolioManager if bot not found
+            print(f"⚠️ Bot not found, using PortfolioManager fallback...")
+            from app.broker.portfolio import PortfolioManager
+            from app.db import get_db
+            db = next(get_db())
+            portfolio_mgr = PortfolioManager(db)
+            
+            action_str = "BUY" if proposal["action"] == 1 else "SELL" if proposal["action"] == 2 else "HOLD"
+            
+            if action_str in ["BUY", "SELL"]:
+                result = portfolio_mgr.execute_trade(
+                    user_id=user_id_int,
+                    symbol=symbol,
+                    action=action_str,
+                    quantity=proposal.get("quantity", 1),
+                    price=proposal["price"],
+                    asset_type=proposal.get("asset_type", "stock")
+                )
+                
+                # Remove from proposals
+                if proposal_key and proposal_key in trade_proposals:
+                    del trade_proposals[proposal_key]
+                elif proposal_id in pending_proposals:
+                    del pending_proposals[proposal_id]
+                
+                return {"status": "executed", "message": f"{action_str} order executed successfully", "result": result}
+            else:
+                return {"status": "ignored", "message": "HOLD action - no trade executed"}
             
     except Exception as e:
         print(f"❌ Trade execution error: {e}")
-        # Remove from pending proposals on error
-        if proposal_id in pending_proposals:
+        import traceback
+        traceback.print_exc()
+        # Remove from proposals on error
+        if proposal_key and proposal_key in trade_proposals:
+            del trade_proposals[proposal_key]
+        elif proposal_id in pending_proposals:
             del pending_proposals[proposal_id]
         raise HTTPException(status_code=500, detail=f"Trade execution failed: {str(e)}")
 
@@ -1386,15 +1721,40 @@ def reject_trade(payload: dict):
     if not proposal_id or not user_id:
         raise HTTPException(status_code=400, detail="proposal_id and user_id are required")
     
-    # Find the proposal in pending proposals
-    if proposal_id not in pending_proposals:
-        raise HTTPException(status_code=404, detail="Proposal not found or already processed")
+    print(f"❌ Reject trade request: proposal_id={proposal_id}, user_id={user_id}")
     
-    proposal = pending_proposals[proposal_id]
+    # Try to find proposal in RL bot's trade_proposals (new system)
+    from app.bot.rl_trader import trade_proposals
+    
+    proposal_found = None
+    proposal_key = None
+    
+    # Search in trade_proposals dictionary
+    for key, prop in trade_proposals.items():
+        if prop.get("proposal_id") == proposal_id or prop.get("user_id") == user_id:
+            if prop.get("proposal_id") == proposal_id:
+                proposal_found = prop
+                proposal_key = key
+                break
+    
+    if not proposal_found:
+        # Fallback to old pending_proposals system
+        if proposal_id in pending_proposals:
+            proposal_found = pending_proposals[proposal_id]
+        else:
+            print(f"❌ Proposal not found: {proposal_id}")
+            raise HTTPException(status_code=404, detail=f"Proposal {proposal_id} not found or already processed")
+    
+    proposal = proposal_found
     action_str = "BUY" if proposal["action"] == 1 else "SELL" if proposal["action"] == 2 else "HOLD"
     
-    # Remove from pending proposals
-    del pending_proposals[proposal_id]
+    # Remove from proposals
+    if proposal_key and proposal_key in trade_proposals:
+        del trade_proposals[proposal_key]
+        print(f"✅ Removed proposal from trade_proposals: {proposal_key}")
+    elif proposal_id in pending_proposals:
+        del pending_proposals[proposal_id]
+        print(f"✅ Removed proposal from pending_proposals: {proposal_id}")
     
     # Send rejection notification
     send_notification(user_id, {
